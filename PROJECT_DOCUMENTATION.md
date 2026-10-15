@@ -136,6 +136,17 @@ uncontrolled internet usage leads to several operational and security problems:
     The entire system must run using only Python standard library + FastAPI
     and SQLite on an existing Windows PC with no specialized hardware.
 
+12. **Local Traffic Pattern Learning**
+    Learn per-device hourly request baselines from up to 30 days of collected
+    gateway logs and surface unusually high activity when at least three prior
+    days are available for comparison. Analysis runs locally using SQLite and
+    Python; raw device activity is not sent to a third-party AI service.
+
+13. **Student Attendance Check-in**
+    Register a student's PRN, name, and batch against the MAC address resolved
+    from the Windows hotspot neighbor table. Record one attendance entry per
+    device per day when its registered device generates proxy traffic.
+
 ---
 
 ---
@@ -285,6 +296,12 @@ Every HTTP/HTTPS request captured becomes one row:
 
 **latency_targets table** — Network monitoring endpoints:
 - Label, host, port, enabled flag
+
+**students table** — One student registration per hotspot MAC address:
+- MAC address, unique PRN, name, batch, registration timestamp
+
+**attendance table** — One daily check-in per registered MAC:
+- PRN/name/batch snapshot, date, first and last seen time, proxy request count
 
 ## Data Volume Estimates
 
@@ -530,6 +547,7 @@ Every 30 seconds:
 | Theme | CSS Variables | Native | Dark/light mode |
 | Storage | localStorage | Native JS | Theme preference |
 | Notifications | Notification API | Native JS | Browser alerts |
+| Attendance identity | Windows ARP neighbor table | OS utility | Resolve hotspot IP to MAC |
 
 ## File Inventory
 
@@ -561,6 +579,13 @@ Phone (iPhone):
   2. Settings → Wi-Fi → (i) → HTTP Proxy → Manual
   3. Server: 192.168.137.1 | Port: 8080
 ```
+
+On an unregistered device, the first plain HTTP request through the proxy
+redirects to the student registration form at
+`http://192.168.137.1:5000/attendance/register`. The proxy cannot launch a
+browser or redirect HTTPS CONNECT traffic without TLS interception. Windows
+must resolve the hotspot client's MAC from its neighbor table; randomized
+per-network MAC addresses must stay stable for recognition to persist.
 
 ---
 

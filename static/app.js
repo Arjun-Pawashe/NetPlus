@@ -55,6 +55,9 @@ function formatRelTime(sec) {
     const m=Math.floor(sec/60); if (m<60) return `${m}m ago`;
     return `${Math.floor(m/60)}h ago`;
 }
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
 function catClass(cat) {
     const m = {'Academic & Learning':'cat-academic','Entertainment & Social':'cat-social','Gaming & Arcade':'cat-gaming',
                'Proxy & Bypass':'cat-proxy','Search & Knowledge':'cat-search','Messaging & Collab':'cat-messaging','Cloud & Infrastructure':'cat-cloud'};
@@ -187,6 +190,74 @@ async function fetchBandwidthTrend() {
     } catch(e) { console.warn('Bandwidth trend error',e); }
 }
 document.getElementById('btnRefreshBandwidth').addEventListener('click', fetchBandwidthTrend);
+
+/* ─── Local AI Traffic Analysis ───────────────── */
+async function fetchAIAnalysis() {
+    const content = document.getElementById('aiAnalysisContent');
+    try {
+        const data = await fetch(`/api/ai/analysis?mode=${currentMode}`).then(r => r.json());
+        document.getElementById('aiTrainingStatus').textContent =
+            `${Number(data.training_requests || 0).toLocaleString()} requests · ${data.devices_trained || 0} devices`;
+        const insights = (data.insights || []).map(text => `<li>${text}</li>`).join('');
+        const anomalies = data.anomalies || [];
+        const rows = anomalies.length ? anomalies.map(item => `
+            <div class="ai-anomaly ${item.severity}">
+                <span class="ai-anomaly-severity">${item.severity.toUpperCase()}</span>
+                <div><strong>${item.device}</strong><small>${item.ip} · ${item.hour}</small></div>
+                <div class="ai-anomaly-count">${item.observed}<small> requests (expected ${item.expected})</small></div>
+            </div>`).join('') : '<div class="ai-no-anomalies"><i class="fa-solid fa-circle-check"></i> No unusual activity detected this hour</div>';
+        content.innerHTML = `<ul class="ai-insights">${insights}</ul><div class="ai-anomaly-list">${rows}</div>
+            <p class="ai-privacy"><i class="fa-solid fa-lock"></i> ${data.privacy}</p>`;
+    } catch (error) {
+        content.innerHTML = '<div class="ai-no-anomalies">Analysis is temporarily unavailable.</div>';
+    }
+}
+document.getElementById('btnRefreshAI').addEventListener('click', fetchAIAnalysis);
+
+/* ─── Attendance ─────────────────────────────── */
+async function fetchAttendance() {
+    const date = document.getElementById('attendanceDate').value;
+    const body = document.getElementById('attendanceTableBody');
+    try {
+        const rows = await fetch(`/api/attendance?date=${encodeURIComponent(date)}`).then(r => r.json());
+        document.getElementById('attendanceCount').textContent = `${rows.length} Present`;
+        body.innerHTML = rows.length ? rows.map(row => `
+            <tr><td class="cell-ip">${escapeHtml(row.prn)}</td><td class="cell-domain">${escapeHtml(row.name)}</td>
+            <td>${escapeHtml(row.batch)}</td><td>${escapeHtml(row.first_seen.split(' ')[1] || row.first_seen)}</td>
+            <td>${escapeHtml(row.last_seen.split(' ')[1] || row.last_seen)}</td><td>${row.connections}</td></tr>`).join('')
+            : '<tr class="table-empty-row"><td colspan="6">No attendance records for this date.</td></tr>';
+    } catch (error) {
+        body.innerHTML = '<tr class="table-empty-row"><td colspan="6">Attendance is temporarily unavailable.</td></tr>';
+    }
+}
+document.getElementById('btnRefreshAttendance').addEventListener('click', fetchAttendance);
+document.getElementById('attendanceDate').addEventListener('change', fetchAttendance);
+document.getElementById('adminStudentForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = form.querySelector('button[type="submit"]');
+    button.disabled = true;
+    try {
+        const response = await fetch('/api/students', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+                mac_address: document.getElementById('adminStudentMac').value,
+                prn: document.getElementById('adminStudentPrn').value,
+                name: document.getElementById('adminStudentName').value,
+                batch: document.getElementById('adminStudentBatch').value
+            })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || 'Student registration failed.');
+        form.reset();
+        toast(result.message, 'fa-user-check', '#34d399');
+        fetchAttendance();
+    } catch (error) {
+        toast(error.message, 'fa-circle-exclamation', '#fb7185');
+    } finally {
+        button.disabled = false;
+    }
+});
 
 /* ─── Latency Monitor ───────────────────────── */
 const LATENCY_COLORS = ['#6366f1','#06b6d4','#10b981','#f59e0b','#f43f5e','#a855f7'];
@@ -721,10 +792,17 @@ document.addEventListener('DOMContentLoaded', ()=>{
     fetchDevices();
     fetchLogs();
     fetchBandwidthTrend();
+    fetchAIAnalysis();
+    const attendanceDate = document.getElementById('attendanceDate');
+    const today = new Date();
+    attendanceDate.value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+    fetchAttendance();
     fetchLatency();
     connectWS();
     // Auto-refresh every 4s
     setInterval(()=>{ fetchStats(); fetchDevices(); }, 4000);
+    setInterval(fetchAIAnalysis, 30000);
+    setInterval(fetchAttendance, 30000);
     // Bandwidth trend every 60s
     setInterval(fetchBandwidthTrend, 60000);
     // Latency every 35s (slightly offset from backend 30s)

@@ -7,6 +7,8 @@ import sqlite3
 import os
 import sys
 import re
+import subprocess
+import secrets
 from datetime import datetime
 
 try:
@@ -70,6 +72,29 @@ def init_db():
             host TEXT,
             port INTEGER DEFAULT 80,
             enabled INTEGER DEFAULT 1
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            mac_address TEXT PRIMARY KEY,
+            prn TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            batch TEXT NOT NULL,
+            registered_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mac_address TEXT NOT NULL,
+            prn TEXT NOT NULL,
+            student_name TEXT NOT NULL,
+            batch TEXT NOT NULL,
+            attendance_date TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            connection_count INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(mac_address, attendance_date)
         )
     """)
     cursor.execute("SELECT COUNT(*) FROM latency_targets")
@@ -247,6 +272,8 @@ class NetworkMonitoringEngine:
         self.lock = threading.Lock()
         self._quota_cache = {}   # {ip: daily_mb_limit}
         self._quota_cache_ts = 0
+        self._mac_cache = {}
+        self._registration_tokens = {}
         init_db()
         self.load_blocklist()
         self._refresh_quota_cache()
@@ -419,6 +446,73 @@ class NetworkMonitoringEngine:
                 "device_type": dev_type
             }
 
+    def get_mac_for_ip(self, ip):
+        """Resolve a hotspot client's current MAC from the Windows neighbor table."""
+        if ip in self._mac_cache and time.time() - self._mac_cache[ip][1] < 10:
+            return self._mac_cache[ip][0]
+        if not ip.startswith("192.168.137."):
+            return None
+        try:
+            result = subprocess.run(
+                ["arp", "-a", ip], capture_output=True, text=True,
+                timeout=2, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            match = re.search(r"\b" + re.escape(ip) + r"\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b", result.stdout, re.I)
+            mac = match.group(1).replace("-", ":").lower() if match else None
+            self._mac_cache[ip] = (mac, time.time())
+            return mac
+        except Exception:
+            return None
+
+    def get_student_by_mac(self, mac):
+        if not mac:
+            return None
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT mac_address, prn, name, batch FROM students WHERE mac_address=?", (mac,)
+                ).fetchone()
+            return {"mac_address": row[0], "prn": row[1], "name": row[2], "batch": row[3]} if row else None
+        except sqlite3.Error:
+            return None
+
+    def record_attendance(self, student):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        today = now[:10]
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                INSERT INTO attendance
+                    (mac_address, prn, student_name, batch, attendance_date, first_seen, last_seen, connection_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(mac_address, attendance_date) DO UPDATE SET
+                    last_seen=excluded.last_seen,
+                    connection_count=attendance.connection_count + 1
+            """, (student["mac_address"], student["prn"], student["name"], student["batch"], today, now, now))
+
+    def issue_registration_token(self, ip):
+        now = time.time()
+        for existing, (_, expires) in list(self._registration_tokens.items()):
+            if expires <= now:
+                self._registration_tokens.pop(existing, None)
+        for existing, (token_ip, expires) in self._registration_tokens.items():
+            if token_ip == ip and expires > now:
+                return existing
+        token = secrets.token_urlsafe(24)
+        self._registration_tokens[token] = (ip, now + 600)
+        return token
+
+    def get_registration_ip(self, token):
+        item = self._registration_tokens.get(token)
+        if not item:
+            return None
+        if item[1] < time.time():
+            self._registration_tokens.pop(token, None)
+            return None
+        return item[0]
+
+    def consume_registration_token(self, token):
+        self._registration_tokens.pop(token, None)
+
     def log_event(self, entry):
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -533,6 +627,24 @@ class NetworkMonitoringEngine:
             # Normalize to clean website & category
             clean_site, category, is_background = clean_and_normalize_domain(host)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            mac_address = self.get_mac_for_ip(client_ip)
+            student = self.get_student_by_mac(mac_address)
+            if student:
+                self.record_attendance(student)
+
+            # Plain HTTP can be redirected to the registration page. HTTPS CONNECT
+            # cannot be redirected safely without intercepting TLS certificates.
+            is_local_portal = host.lower().strip("[]") in {"192.168.137.1", "localhost", "127.0.0.1"}
+            if method != 'CONNECT' and not is_local_portal and not student and not is_background:
+                token = self.issue_registration_token(client_ip)
+                location = f"http://192.168.137.1:5000/attendance/register?token={token}"
+                response = (
+                    "HTTP/1.1 302 Found\r\n"
+                    f"Location: {location}\r\n"
+                    "Cache-Control: no-store\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+                client_socket.sendall(response.encode("ascii"))
+                return
 
             # Risk check
             blocked = self.is_blocked(host, clean_site)

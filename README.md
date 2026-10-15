@@ -44,6 +44,7 @@ NetPlus turns your Windows PC into a full network monitoring gateway. Any phone,
 ### Analytics
 | Feature | Description |
 |---------|-------------|
+| Local AI Traffic Analysis | Learns per-device hourly request baselines from the last 30 days of gateway logs and highlights unusual activity after at least 3 historical comparison days; all analysis stays on the gateway |
 | Live KPI Dashboard | Total visits, bandwidth, devices, blocks — auto-refreshed every 4s |
 | Activity Timeline Chart | Live line chart streamed via WebSocket |
 | Category Donut Chart | Academic, Social, Gaming, Messaging breakdown |
@@ -64,6 +65,16 @@ NetPlus turns your Windows PC into a full network monitoring gateway. Any phone,
 | CSV Log Export | Full log export |
 | Browser Notifications | Desktop alert when blocked site attempted |
 | Animated Particle Background | 80-node network canvas animation |
+
+### Student Attendance
+| Feature | Description |
+|---------|-------------|
+| First-use Student Registration | First plain HTTP visit redirects an unregistered hotspot device to a PRN, name, and batch form |
+| MAC-based Daily Check-in | Windows hotspot neighbor table associates the device IP with its MAC; known devices are checked in on proxy activity, once per calendar day |
+| Attendance Dashboard | View daily attendance, batch, first seen, last seen, and proxy request count |
+| Admin Device Registration | Register or update a student's PRN, name, and batch against a MAC directly from the dashboard |
+
+The gateway cannot launch a browser on a device. The registration redirect happens only after that device makes a plain HTTP request through the configured proxy; HTTPS CONNECT traffic cannot be redirected without TLS interception. Windows ARP lookup must be able to resolve the hotspot client's MAC. Devices using randomized MAC addresses must keep the same private address for this hotspot, or they may need to register again.
 
 ---
 
@@ -166,6 +177,12 @@ Start browsing — activity appears instantly on the dashboard!
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | /api/stats | KPI metrics. Params: mode, date_from, date_to |
+| GET | /api/ai/analysis | Local rolling traffic analysis with per-device hourly anomaly estimates |
+| GET | /attendance/register | Student registration page |
+| POST | /api/attendance/register | Register PRN, name, and batch against the hotspot MAC and mark today's attendance |
+| GET | /api/attendance | Attendance records. Optional date=YYYY-MM-DD |
+| GET | /api/students | Registered student roster |
+| POST | /api/students | Admin registration by MAC address, PRN, name, and batch |
 | GET | /api/devices | All devices with liveness, stats, quotas |
 | GET | /api/devices/{ip}/activity | Full activity for one device |
 | GET | /api/sessions/{ip} | Session-grouped browsing history |

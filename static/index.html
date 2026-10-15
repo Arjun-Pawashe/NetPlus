@@ -138,6 +138,54 @@
             </div>
         </section>
 
+        <!-- ATTENDANCE -->
+        <section class="panel attendance-panel">
+            <div class="panel-header">
+                <div class="panel-title-group">
+                    <div class="panel-icon" style="background:rgba(16,185,129,.12);color:#10b981"><i class="fa-solid fa-user-check"></i></div>
+                    <div><h2>Student Attendance</h2><p>Attendance is recorded by the registered hotspot device each day</p></div>
+                </div>
+                <div class="panel-actions">
+                    <input type="date" id="attendanceDate" class="filter-select" aria-label="Attendance date">
+                    <span class="device-count-badge" id="attendanceCount">0 Present</span>
+                    <button class="icon-btn" id="btnRefreshAttendance" title="Refresh attendance"><i class="fa-solid fa-rotate"></i></button>
+                </div>
+            </div>
+            <div class="attendance-admin-entry">
+                <div class="attendance-admin-copy"><strong>Register a student manually</strong><span>Link a PRN and student details to a device MAC address.</span></div>
+                <form id="adminStudentForm" class="block-form">
+                    <input id="adminStudentMac" type="text" placeholder="MAC address (AA:BB:CC:DD:EE:FF)" maxlength="17" required>
+                    <input id="adminStudentPrn" type="text" placeholder="PRN" maxlength="40" required>
+                    <input id="adminStudentName" type="text" placeholder="Student name" maxlength="100" required>
+                    <input id="adminStudentBatch" type="text" placeholder="Batch" maxlength="50" required>
+                    <button type="submit" class="solid-btn"><i class="fa-solid fa-user-plus"></i> Register</button>
+                </form>
+            </div>
+            <div class="table-scroll">
+                <table class="log-table">
+                    <thead><tr><th>PRN</th><th>Student</th><th>Batch</th><th>First Proxy Activity</th><th>Last Seen</th><th>Proxy Requests</th></tr></thead>
+                    <tbody id="attendanceTableBody"><tr class="table-empty-row"><td colspan="6">No attendance records for this date.</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- LOCAL AI ANALYSIS -->
+        <section class="panel ai-analysis-panel">
+            <div class="panel-header">
+                <div class="panel-title-group">
+                    <div class="panel-icon" style="background:rgba(168,85,247,.12);color:#a855f7"><i class="fa-solid fa-brain"></i></div>
+                    <div><h2>AI Traffic Analysis</h2><p>Local learning from device activity · rolling 30-day baseline</p></div>
+                </div>
+                <div class="panel-actions">
+                    <span class="device-count-badge" id="aiTrainingStatus">Learning from traffic</span>
+                    <button class="icon-btn" id="btnRefreshAI" title="Refresh analysis"><i class="fa-solid fa-rotate"></i></button>
+                </div>
+            </div>
+            <div class="ai-analysis-content" id="aiAnalysisContent">
+                <div class="latency-loading"><i class="fa-solid fa-spinner fa-spin"></i> Analyzing device activity…</div>
+            </div>
+        </section>
+
         <!-- CHARTS ROW (3-column triptych) -->
         <div class="charts-triptych">
             <div class="chart-panel large-chart">
@@ -391,7 +439,7 @@
                     <div class="setup-step">
                         <div class="step-num">4</div>
                         <div class="step-body"><h4>Browse — you're being monitored!</h4>
-                        <p>Open Chrome/Safari and visit any site. It appears instantly on this dashboard.</p></div>
+                        <p>Open Chrome/Safari and visit a plain HTTP site. New devices are redirected to student registration; registered devices are checked in automatically on proxy activity.</p></div>
                     </div>
                 </div>
             </div>

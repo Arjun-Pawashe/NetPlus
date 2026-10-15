@@ -5,9 +5,10 @@ import threading
 import sqlite3
 import socket
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Optional, List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,6 +95,18 @@ class LatencyTargetRequest(BaseModel):
     label: str
     host: str
     port: int = 80
+
+class StudentRegistrationRequest(BaseModel):
+    token: str
+    prn: str
+    name: str
+    batch: str
+
+class StudentAdminRegistrationRequest(BaseModel):
+    mac_address: str
+    prn: str
+    name: str
+    batch: str
 
 # ─── Helpers ──────────────────────────────────────────────────
 def calculate_device_liveness(last_seen_str):
@@ -193,6 +206,172 @@ def get_stats(mode: str = "clean", date_from: Optional[str] = None, date_to: Opt
         "categories": categories,
         "top_domains": top_domains,
     }
+
+# ─── Local AI-style traffic analysis ─────────────────────────
+@app.get("/api/ai/analysis")
+def get_ai_analysis(mode: str = "clean"):
+    """Learn per-device hourly request baselines from local history and report anomalies."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    bg_filter = "AND is_background=0" if mode == "clean" else ""
+    since = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(f"""
+        SELECT client_ip, device_name, strftime('%Y-%m-%d', timestamp) AS day,
+               CAST(strftime('%H', timestamp) AS INTEGER) AS hour,
+               COUNT(*) AS requests, COALESCE(SUM(bytes_transferred),0) AS bytes
+        FROM access_logs WHERE timestamp >= ? {bg_filter}
+        GROUP BY client_ip, day, hour ORDER BY day DESC
+    """, (since,))
+    rows = c.fetchall()
+    c.execute(f"SELECT COUNT(DISTINCT client_ip), COUNT(*), COALESCE(SUM(bytes_transferred),0) FROM access_logs WHERE timestamp >= ? {bg_filter}", (since,))
+    device_count, log_count, total_bytes = c.fetchone()
+    conn.close()
+
+    # Build an hourly-per-device baseline from prior days; evaluate only the current hour.
+    today = datetime.now().strftime("%Y-%m-%d")
+    current_hour = datetime.now().hour
+    buckets = {}
+    current = {}
+    names = {}
+    for ip, name, day, hour, requests, byte_count in rows:
+        names[ip] = name or ip
+        if hour != current_hour:
+            continue
+        if day == today:
+            current[ip] = (requests, byte_count)
+        else:
+            buckets.setdefault(ip, []).append(requests)
+
+    anomalies = []
+    for ip, (observed, byte_count) in current.items():
+        history = buckets.get(ip, [])
+        if len(history) < 3:
+            continue
+        mean = sum(history) / len(history)
+        variance = sum((value - mean) ** 2 for value in history) / len(history)
+        stddev = variance ** 0.5
+        threshold = max(mean * 2, mean + 2 * stddev, mean + 5)
+        if observed > threshold:
+            anomalies.append({"device": names[ip], "ip": ip, "observed": observed,
+                              "expected": round(mean, 1), "hour": f"{current_hour:02d}:00",
+                              "bytes": byte_count, "severity": "high" if observed > threshold * 2 else "medium"})
+    anomalies.sort(key=lambda item: item["observed"] / max(item["expected"], 1), reverse=True)
+
+    insights = []
+    if log_count:
+        insight_conn = sqlite3.connect(DB_PATH)
+        c = insight_conn.cursor()
+        c.execute(f"""SELECT category, COUNT(*) FROM access_logs
+                    WHERE timestamp >= ? {bg_filter}
+                    GROUP BY category ORDER BY COUNT(*) DESC LIMIT 1""", (since,))
+        top_category = c.fetchone()
+        c.execute(f"""SELECT CAST(strftime('%H', timestamp) AS INTEGER), COUNT(*) FROM access_logs
+                    WHERE timestamp >= ? {bg_filter}
+                    GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1""", (since,))
+        peak_hour = c.fetchone()
+        insight_conn.close()
+        if top_category:
+            insights.append(f"Most common traffic category: {top_category[0]} ({top_category[1]:,} requests in 30 days).")
+        if peak_hour:
+            insights.append(f"Peak activity hour: {peak_hour[0]:02d}:00 ({peak_hour[1]:,} requests in 30 days).")
+        if anomalies:
+            insights.append(f"{len(anomalies)} device(s) have unusually high activity this hour compared with their own history.")
+        else:
+            insights.append("No unusual per-device activity detected for this hour.")
+    else:
+        insights.append("Waiting for device traffic. Analysis learns as this gateway collects logs.")
+
+    return {"model": "Per-device hourly baseline", "training_days": 30,
+            "training_requests": log_count, "devices_trained": device_count,
+            "trained_days_required": 3, "anomalies": anomalies, "insights": insights,
+            "privacy": "Analysis runs locally on this gateway; raw browsing history is not sent to an external AI service."}
+
+# ─── Student Attendance ──────────────────────────────────────
+@app.get("/attendance/register")
+def attendance_registration_page():
+    page = os.path.join(STATIC_DIR, "attendance.html")
+    return FileResponse(page) if os.path.exists(page) else HTMLResponse("Registration page unavailable", status_code=503)
+
+@app.post("/api/attendance/register")
+def register_attendance_student(req: StudentRegistrationRequest):
+    ip = engine.get_registration_ip(req.token)
+    if not ip:
+        raise HTTPException(400, "This registration link has expired. Open a plain HTTP website again to get a new one.")
+    mac = engine.get_mac_for_ip(ip)
+    if not mac:
+        raise HTTPException(409, "Could not read this device's hotspot MAC address yet. Reconnect to the hotspot and try again.")
+
+    prn = req.prn.strip()
+    name = req.name.strip()
+    batch = req.batch.strip()
+    if not 2 <= len(prn) <= 40:
+        raise HTTPException(422, "Enter a valid PRN (2–40 characters).")
+    if not 2 <= len(name) <= 100:
+        raise HTTPException(422, "Enter your name (2–100 characters).")
+    if not 1 <= len(batch) <= 50:
+        raise HTTPException(422, "Enter a batch (up to 50 characters).")
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO students (mac_address, prn, name, batch, registered_at) VALUES (?, ?, ?, ?, ?)",
+                (mac, prn, name, batch, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            )
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "This device or PRN is already registered. Contact the administrator if your details need correction.")
+
+    engine.consume_registration_token(req.token)
+    student = {"mac_address": mac, "prn": prn, "name": name, "batch": batch}
+    engine.record_attendance(student)
+    return {"status": "ok", "name": name, "prn": prn, "batch": batch,
+            "attendance_date": datetime.now().strftime("%Y-%m-%d")}
+
+@app.get("/api/attendance")
+def get_attendance(date: Optional[str] = None):
+    attendance_date = date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(attendance_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Date must use YYYY-MM-DD format.")
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT prn, student_name, batch, attendance_date, first_seen, last_seen, connection_count
+            FROM attendance WHERE attendance_date=? ORDER BY first_seen DESC
+        """, (attendance_date,)).fetchall()
+    return [{"prn": r[0], "name": r[1], "batch": r[2], "date": r[3],
+             "first_seen": r[4], "last_seen": r[5], "connections": r[6]} for r in rows]
+
+@app.get("/api/students")
+def get_students():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT prn, name, batch, registered_at FROM students ORDER BY name COLLATE NOCASE").fetchall()
+    return [{"prn": r[0], "name": r[1], "batch": r[2], "registered_at": r[3]} for r in rows]
+
+@app.post("/api/students")
+def admin_register_student(req: StudentAdminRegistrationRequest):
+    mac = req.mac_address.strip().replace("-", ":").lower()
+    if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac):
+        raise HTTPException(422, "Enter a MAC address in the format AA:BB:CC:DD:EE:FF.")
+    prn, name, batch = req.prn.strip(), req.name.strip(), req.batch.strip()
+    if not 2 <= len(prn) <= 40:
+        raise HTTPException(422, "Enter a valid PRN (2–40 characters).")
+    if not 2 <= len(name) <= 100:
+        raise HTTPException(422, "Enter a name (2–100 characters).")
+    if not 1 <= len(batch) <= 50:
+        raise HTTPException(422, "Enter a batch (up to 50 characters).")
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                INSERT INTO students (mac_address, prn, name, batch, registered_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(mac_address) DO UPDATE SET
+                    prn=excluded.prn, name=excluded.name, batch=excluded.batch,
+                    registered_at=excluded.registered_at
+            """, (mac, prn, name, batch, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "That PRN is already registered to a different MAC address.")
+    return {"status": "ok", "message": f"{name} ({prn}) registered for {mac}. Attendance will be recorded on the next proxy activity."}
 
 # ─── Devices ──────────────────────────────────────────────────
 @app.get("/api/devices")
