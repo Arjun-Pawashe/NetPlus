@@ -74,9 +74,12 @@ def startup_event():
     # Start proxy engine
     t1 = threading.Thread(target=engine.start, daemon=True)
     t1.start()
-    # Start latency monitor
-    t2 = threading.Thread(target=latency_monitor_loop, daemon=True)
+    # Start hotspot ARP device monitor
+    t2 = threading.Thread(target=engine.hotspot_monitor_loop, daemon=True)
     t2.start()
+    # Start latency monitor
+    t3 = threading.Thread(target=latency_monitor_loop, daemon=True)
+    t3.start()
     print("✨ NetPulse v4.0 Active — http://localhost:5000")
 
 # ─── Pydantic Models ──────────────────────────────────────────
@@ -205,6 +208,9 @@ def get_stats(mode: str = "clean", date_from: Optional[str] = None, date_to: Opt
         "total_devices": len(rows),
         "categories": categories,
         "top_domains": top_domains,
+        "proxy_host": getattr(engine, "host_display", "192.168.137.1"),
+        "proxy_port": getattr(engine, "port", 8088),
+        "proxy_ports": getattr(engine, "active_ports", [getattr(engine, "port", 8088)]),
     }
 
 # ─── Local AI-style traffic analysis ─────────────────────────
@@ -376,6 +382,10 @@ def admin_register_student(req: StudentAdminRegistrationRequest):
 # ─── Devices ──────────────────────────────────────────────────
 @app.get("/api/devices")
 def get_devices(mode: str = "clean"):
+    try:
+        engine.scan_hotspot_devices()
+    except Exception:
+        pass
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT ip, custom_name, auto_name, device_type, first_seen, last_seen FROM devices ORDER BY last_seen DESC")

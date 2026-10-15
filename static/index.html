@@ -33,7 +33,7 @@
                 <div class="proxy-icon"><i class="fa-solid fa-tower-broadcast"></i></div>
                 <div class="proxy-info">
                     <span class="proxy-label">GATEWAY PROXY</span>
-                    <span class="proxy-addr">192.168.137.1:8080 <i class="fa-regular fa-copy"></i></span>
+                    <span class="proxy-addr" id="topbarProxyAddr">192.168.137.1:8088 <i class="fa-regular fa-copy"></i></span>
                 </div>
             </div>
         </div>
@@ -130,7 +130,7 @@
                 <div class="empty-state">
                     <div class="empty-icon"><i class="fa-solid fa-plug-circle-xmark"></i></div>
                     <h3>No Devices Connected</h3>
-                    <p>Connect your phone to the PC Hotspot and configure proxy <code>192.168.137.1:8080</code></p>
+                    <p>Connect your phone to the PC Hotspot and configure proxy <code id="emptyProxyAddr">192.168.137.1:8088</code></p>
                     <button class="btn-setup-link" onclick="document.getElementById('guideModal').classList.add('active')">
                         <i class="fa-solid fa-bolt"></i> Quick Setup Guide
                     </button>
@@ -432,8 +432,8 @@
                         <div class="step-body"><h4>Set Proxy on Phone (10 seconds)</h4>
                         <p>In phone Wi-Fi settings → gear/&#x2139; → <strong>Proxy: Manual</strong>:</p>
                         <div class="proxy-box">
-                            <div class="proxy-row"><span>Proxy Host</span><code>192.168.137.1</code></div>
-                            <div class="proxy-row"><span>Port</span><code>8080</code></div>
+                            <div class="proxy-row"><span>Proxy Host</span><code id="guideProxyHost">192.168.137.1</code></div>
+                            <div class="proxy-row"><span>Port</span><code id="guideProxyPort">8088</code></div>
                         </div></div>
                     </div>
                     <div class="setup-step">

@@ -262,11 +262,15 @@ def parse_user_agent(ua_string):
     return {"name": "Unknown Device", "type": "mobile", "os": "Unknown"}
 
 class NetworkMonitoringEngine:
-    def __init__(self, host='0.0.0.0', port=8080):
+    def __init__(self, host='0.0.0.0', port=None):
+        if port is None:
+            port = int(os.environ.get("NETPULSE_PROXY_PORT", 8088))
         self.host = host
         self.port = port
+        self.host_display = '192.168.137.1'
+        self.active_ports = []
         self.running = False
-        self.server_socket = None
+        self.server_sockets = []
         self.blocked_domains = set()
         self.ws_subscribers = []
         self.lock = threading.Lock()
@@ -512,6 +516,30 @@ class NetworkMonitoringEngine:
 
     def consume_registration_token(self, token):
         self._registration_tokens.pop(token, None)
+
+    def scan_hotspot_devices(self):
+        """Scans the Windows ARP table for connected devices on the 192.168.137.x hotspot subnet."""
+        try:
+            res = subprocess.run(
+                ["arp", "-a"], capture_output=True, text=True, timeout=3, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            clients = re.findall(r'(192\.168\.137\.(?!1\b|255\b)\d+)\s+([0-9a-fA-F-]+)', res.stdout)
+            for ip, raw_mac in clients:
+                mac = raw_mac.replace("-", ":").lower()
+                self._mac_cache[ip] = (mac, time.time())
+                self.get_or_create_device(ip, "")
+                student = self.get_student_by_mac(mac)
+                if student:
+                    self.record_attendance(student)
+        except Exception:
+            pass
+
+    def hotspot_monitor_loop(self):
+        while True:
+            if self.running:
+                self.scan_hotspot_devices()
+            time.sleep(5)
 
     def log_event(self, entry):
         try:
@@ -784,15 +812,43 @@ class NetworkMonitoringEngine:
 
     def start(self):
         self.running = True
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(200)
-        print(f"🚀 Gateway Proxy listening on {self.host}:{self.port}")
+        self.server_sockets = []
+        self.active_ports = []
+
+        candidate_ports = [self.port]
+        if self.port != 8080:
+            candidate_ports.append(8080)
+
+        for p in candidate_ports:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((self.host, p))
+                s.listen(200)
+                self.server_sockets.append((s, p))
+                self.active_ports.append(p)
+                print(f"🚀 Gateway Proxy listening on {self.host}:{p}")
+            except Exception as e:
+                if p == 8080:
+                    print(f"ℹ️ Port 8080 is reserved by another service (e.g. Oracle Database XE). Active proxy port: {self.port}")
+                else:
+                    print(f"❌ Failed to bind proxy port {p}: {e}")
+
+        if not self.server_sockets:
+            print("❌ Error: No proxy listening ports could be established.")
+            return
+
+        for s, p in self.server_sockets:
+            t = threading.Thread(target=self._listen_loop, args=(s, p), daemon=True)
+            t.start()
 
         while self.running:
+            time.sleep(1)
+
+    def _listen_loop(self, server_socket, port):
+        while self.running:
             try:
-                client_sock, client_addr = self.server_socket.accept()
+                client_sock, client_addr = server_socket.accept()
                 t = threading.Thread(target=self.handle_client, args=(client_sock, client_addr), daemon=True)
                 t.start()
             except Exception:
@@ -801,10 +857,11 @@ class NetworkMonitoringEngine:
 
     def stop(self):
         self.running = False
-        if self.server_socket:
+        for s, _ in self.server_sockets:
             try:
-                self.server_socket.close()
-            except:
+                s.close()
+            except Exception:
                 pass
+        self.server_sockets = []
 
 engine = NetworkMonitoringEngine()

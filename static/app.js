@@ -8,6 +8,8 @@ let currentDeviceFilter = 'All';
 let currentMode = 'clean';
 let activeModalIp = null;
 let activeTab = 'overview';
+let currentProxyHost = '192.168.137.1';
+let currentProxyPort = 8088;
 
 /* ─── Animated Particle Canvas ───────────────── */
 (function initBg() {
@@ -166,6 +168,16 @@ async function fetchStats() {
         document.getElementById('valTotalBlocked').textContent = d.total_blocked.toLocaleString();
         document.getElementById('valActiveDevices').textContent = d.active_devices;
         document.getElementById('subActiveDevices').innerHTML = `<i class="fa-solid fa-circle-dot"></i> ${d.active_devices} Online / ${d.total_devices} Recorded`;
+        if (d.proxy_host) currentProxyHost = d.proxy_host;
+        if (d.proxy_port) currentProxyPort = d.proxy_port;
+        const topbarAddr = document.getElementById('topbarProxyAddr');
+        if (topbarAddr) topbarAddr.innerHTML = `${currentProxyHost}:${currentProxyPort} <i class="fa-regular fa-copy"></i>`;
+        const guidePort = document.getElementById('guideProxyPort');
+        if (guidePort) guidePort.textContent = currentProxyPort;
+        const guideHost = document.getElementById('guideProxyHost');
+        if (guideHost) guideHost.textContent = currentProxyHost;
+        const emptyAddr = document.getElementById('emptyProxyAddr');
+        if (emptyAddr) emptyAddr.textContent = `${currentProxyHost}:${currentProxyPort}`;
         if (d.categories && Object.keys(d.categories).length) {
             categoryChart.data.labels = Object.keys(d.categories);
             categoryChart.data.datasets[0].data = Object.values(d.categories);
@@ -383,7 +395,7 @@ async function fetchDevices() {
         }
 
         if (!devices.length) {
-            container.innerHTML = `<div class="empty-state"><div class="empty-icon"><i class="fa-solid fa-plug-circle-xmark"></i></div><h3>No Devices Connected</h3><p>Connect your phone to the PC Hotspot and configure proxy <code>192.168.137.1:8080</code></p><button class="btn-setup-link" onclick="document.getElementById('guideModal').classList.add('active')"><i class="fa-solid fa-bolt"></i> Quick Setup Guide</button></div>`;
+            container.innerHTML = `<div class="empty-state"><div class="empty-icon"><i class="fa-solid fa-plug-circle-xmark"></i></div><h3>No Devices Connected</h3><p>Connect your phone to the PC Hotspot and configure proxy <code>${currentProxyHost}:${currentProxyPort}</code></p><button class="btn-setup-link" onclick="document.getElementById('guideModal').classList.add('active')"><i class="fa-solid fa-bolt"></i> Quick Setup Guide</button></div>`;
             return;
         }
 
@@ -721,7 +733,7 @@ document.getElementById('btnClearDates').addEventListener('click', ()=>{
 
 /* ─── Gateway Copy ───────────────────────────── */
 document.getElementById('gatewayBox').addEventListener('click', ()=>{
-    navigator.clipboard.writeText('192.168.137.1:8080').catch(()=>{});
+    navigator.clipboard.writeText(`${currentProxyHost}:${currentProxyPort}`).catch(()=>{});
     toast('Proxy address copied!','fa-copy','#06b6d4');
 });
 
