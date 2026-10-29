@@ -6,6 +6,9 @@ import sqlite3
 import socket
 import json
 import re
+import math
+import csv
+import io
 from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
@@ -14,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from engine import engine, DB_PATH
+from engine import engine, DB_PATH, DEPARTMENTS, YEARS, DIVISIONS
 
 app = FastAPI(title="NetPulse — Cyber NOC 2.0", version="4.0.0")
 
@@ -74,12 +77,9 @@ def startup_event():
     # Start proxy engine
     t1 = threading.Thread(target=engine.start, daemon=True)
     t1.start()
-    # Start hotspot ARP device monitor
-    t2 = threading.Thread(target=engine.hotspot_monitor_loop, daemon=True)
-    t2.start()
     # Start latency monitor
-    t3 = threading.Thread(target=latency_monitor_loop, daemon=True)
-    t3.start()
+    t2 = threading.Thread(target=latency_monitor_loop, daemon=True)
+    t2.start()
     print("✨ NetPulse v4.0 Active — http://localhost:5000")
 
 # ─── Pydantic Models ──────────────────────────────────────────
@@ -103,13 +103,45 @@ class StudentRegistrationRequest(BaseModel):
     token: str
     prn: str
     name: str
+    department: str
+    year: str
+    division: str
+    batch: str
+
+class YearBatchRequest(BaseModel):
+    year: str
     batch: str
 
 class StudentAdminRegistrationRequest(BaseModel):
     mac_address: str
     prn: str
     name: str
+    department: str
+    year: str
+    division: str
     batch: str
+
+class StudentUpdateRequest(BaseModel):
+    prn: str
+    name: str
+    department: str
+    year: str
+    division: str
+    batch: str
+    apply_to_history: bool = True      # also correct past attendance rows of this student
+    date: Optional[str] = None         # used when apply_to_history is False (defaults to today)
+
+class ManualCheckInRequest(BaseModel):
+    prn: str
+    status: Optional[str] = "Present"
+    date: Optional[str] = None
+
+class DirectStudentRegistrationRequest(BaseModel):
+    mac_address: str
+    prn: str
+    name: str
+    batch: str
+    ip_address: Optional[str] = ""
 
 # ─── Helpers ──────────────────────────────────────────────────
 def calculate_device_liveness(last_seen_str):
@@ -195,7 +227,13 @@ def get_stats(mode: str = "clean", date_from: Optional[str] = None, date_to: Opt
     c.execute(f"SELECT {site_col}, COUNT(*), COALESCE(SUM(bytes_transferred),0) FROM access_logs {where} GROUP BY {site_col} ORDER BY COUNT(*) DESC LIMIT 10", params)
     top_domains = [{"domain": r[0], "count": r[1], "bytes": r[2]} for r in c.fetchall()]
 
-    c.execute("SELECT ip, last_seen FROM devices")
+    c.execute("""
+        SELECT d.ip, d.last_seen 
+        FROM devices d
+        WHERE d.ip LIKE '192.168.137.%' 
+           OR EXISTS (SELECT 1 FROM access_logs a WHERE a.client_ip = d.ip)
+           OR EXISTS (SELECT 1 FROM students s WHERE s.mac_address = d.mac_address)
+    """)
     rows = c.fetchall()
     online = sum(1 for r in rows if calculate_device_liveness(r[1])[0] == "Online")
     conn.close()
@@ -208,9 +246,6 @@ def get_stats(mode: str = "clean", date_from: Optional[str] = None, date_to: Opt
         "total_devices": len(rows),
         "categories": categories,
         "top_domains": top_domains,
-        "proxy_host": getattr(engine, "host_display", "192.168.137.1"),
-        "proxy_port": getattr(engine, "port", 8088),
-        "proxy_ports": getattr(engine, "active_ports", [getattr(engine, "port", 8088)]),
     }
 
 # ─── Local AI-style traffic analysis ─────────────────────────
@@ -292,7 +327,69 @@ def get_ai_analysis(mode: str = "clean"):
             "trained_days_required": 3, "anomalies": anomalies, "insights": insights,
             "privacy": "Analysis runs locally on this gateway; raw browsing history is not sent to an external AI service."}
 
-# ─── Student Attendance ──────────────────────────────────────
+# ─── Academic options (Department / Year / Division / year-wise Batches) ───
+def _get_year_batches():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT year, batch FROM year_batches ORDER BY year, batch COLLATE NOCASE").fetchall()
+    result = {y["value"]: [] for y in YEARS}
+    for year, batch in rows:
+        result.setdefault(year, []).append(batch)
+    return result
+
+def _validate_student_fields(prn, name, department, year, division, batch):
+    """Shared validation for the student self-registration page and the admin modal."""
+    if not 2 <= len(prn) <= 40:
+        raise HTTPException(422, "Enter a valid PRN (2–40 characters).")
+    if not 2 <= len(name) <= 100:
+        raise HTTPException(422, "Enter your name (2–100 characters).")
+    if department not in DEPARTMENTS:
+        raise HTTPException(422, "Select a department from the list.")
+    if year not in {y["value"] for y in YEARS}:
+        raise HTTPException(422, "Select a year from the list.")
+    if division not in DIVISIONS:
+        raise HTTPException(422, "Select a division from the list.")
+    if batch not in _get_year_batches().get(year, []):
+        raise HTTPException(422, f"Select a valid batch for {year}.")
+
+@app.get("/api/academic/options")
+def get_academic_options():
+    return {
+        "departments": DEPARTMENTS,
+        "years": YEARS,
+        "divisions": DIVISIONS,
+        "batches": _get_year_batches(),   # year-wise: {"FE": [...], "SE": [...], ...}
+    }
+
+@app.post("/api/academic/batches")
+def add_year_batch(req: YearBatchRequest):
+    year, batch = req.year.strip(), req.batch.strip()
+    if year not in {y["value"] for y in YEARS}:
+        raise HTTPException(422, "Unknown year.")
+    if not 1 <= len(batch) <= 30:
+        raise HTTPException(422, "Batch name must be 1–30 characters.")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT INTO year_batches (year, batch) VALUES (?, ?)", (year, batch))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"Batch '{batch}' already exists for {year}.")
+    return {"status": "ok", "message": f"Batch '{batch}' added to {year}."}
+
+@app.delete("/api/academic/batches/{year}/{batch}")
+def delete_year_batch(year: str, batch: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        in_use = conn.execute("SELECT COUNT(*) FROM students WHERE year=? AND batch=?", (year, batch)).fetchone()[0]
+        if in_use:
+            raise HTTPException(409, f"{in_use} student(s) are in this batch. Move them before deleting it.")
+        conn.execute("DELETE FROM year_batches WHERE year=? AND batch=?", (year, batch))
+    return {"status": "ok", "message": f"Batch '{batch}' removed from {year}."}
+
+@app.post("/api/attendance/prompts/reset")
+def reset_join_prompts(device_key: Optional[str] = None):
+    """Show the one-time join page again (to one device by MAC/IP, or to all devices)."""
+    engine.reset_prompts(device_key)
+    return {"status": "ok", "message": "Join prompt re-enabled." if device_key else "Join prompt re-enabled for all devices."}
+
+# ─── Student Attendance & Device Monitoring ───────────────────
 @app.get("/attendance/register")
 def attendance_registration_page():
     page = os.path.join(STATIC_DIR, "attendance.html")
@@ -307,95 +404,696 @@ def register_attendance_student(req: StudentRegistrationRequest):
     if not mac:
         raise HTTPException(409, "Could not read this device's hotspot MAC address yet. Reconnect to the hotspot and try again.")
 
-    prn = req.prn.strip()
-    name = req.name.strip()
-    batch = req.batch.strip()
-    if not 2 <= len(prn) <= 40:
-        raise HTTPException(422, "Enter a valid PRN (2–40 characters).")
-    if not 2 <= len(name) <= 100:
-        raise HTTPException(422, "Enter your name (2–100 characters).")
-    if not 1 <= len(batch) <= 50:
-        raise HTTPException(422, "Enter a batch (up to 50 characters).")
+    prn, name = req.prn.strip(), req.name.strip()
+    department, year = req.department.strip(), req.year.strip()
+    division, batch = req.division.strip(), req.batch.strip()
+    _validate_student_fields(prn, name, department, year, division, batch)
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "INSERT INTO students (mac_address, prn, name, batch, registered_at) VALUES (?, ?, ?, ?, ?)",
-                (mac, prn, name, batch, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                "INSERT INTO students (mac_address, prn, name, department, year, division, batch, registered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (mac, prn, name, department, year, division, batch, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             )
     except sqlite3.IntegrityError:
         raise HTTPException(409, "This device or PRN is already registered. Contact the administrator if your details need correction.")
 
     engine.consume_registration_token(req.token)
-    student = {"mac_address": mac, "prn": prn, "name": name, "batch": batch}
-    engine.record_attendance(student)
+    student = {"mac_address": mac, "prn": prn, "name": name, "batch": batch,
+               "department": department, "year": year, "division": division}
+    engine.record_attendance(student, ip=ip)
     return {"status": "ok", "name": name, "prn": prn, "batch": batch,
+            "department": department, "year": year, "division": division,
             "attendance_date": datetime.now().strftime("%Y-%m-%d")}
 
 @app.get("/api/attendance")
-def get_attendance(date: Optional[str] = None):
+def get_attendance(date: Optional[str] = None, batch: Optional[str] = None, search: Optional[str] = None,
+                   year: Optional[str] = None, department: Optional[str] = None, division: Optional[str] = None):
     attendance_date = date or datetime.now().strftime("%Y-%m-%d")
     try:
         datetime.strptime(attendance_date, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(400, "Date must use YYYY-MM-DD format.")
+    
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("""
-            SELECT prn, student_name, batch, attendance_date, first_seen, last_seen, connection_count
-            FROM attendance WHERE attendance_date=? ORDER BY first_seen DESC
-        """, (attendance_date,)).fetchall()
-    return [{"prn": r[0], "name": r[1], "batch": r[2], "date": r[3],
-             "first_seen": r[4], "last_seen": r[5], "connections": r[6]} for r in rows]
+        query = """
+            SELECT a.id, a.prn, a.student_name, a.batch, a.mac_address, 
+                   COALESCE(a.ip_address, ''), a.attendance_date, a.first_seen, a.last_seen, 
+                   a.connection_count, COALESCE(a.status, 'Present'),
+                   COALESCE(a.department, ''), COALESCE(a.year, ''), COALESCE(a.division, '')
+            FROM attendance a
+            WHERE a.attendance_date = ?
+        """
+        params = [attendance_date]
+        if batch and batch != "All":
+            query += " AND a.batch = ?"
+            params.append(batch)
+        if year and year != "All":
+            query += " AND a.year = ?"
+            params.append(year)
+        if department and department != "All":
+            query += " AND a.department = ?"
+            params.append(department)
+        if division and division != "All":
+            query += " AND a.division = ?"
+            params.append(division)
+        if search:
+            query += " AND (a.prn LIKE ? OR a.student_name LIKE ? OR a.mac_address LIKE ?)"
+            s = f"%{search.strip()}%"
+            params.extend([s, s, s])
+        
+        query += " ORDER BY a.first_seen DESC"
+        rows = conn.execute(query, params).fetchall()
+
+    results = []
+    now = datetime.now()
+    for r in rows:
+        aid, prn, name, bat, mac, ip, adate, first_s, last_s, count, status, dept, yr, div = r
+        dur_mins = 0
+        is_online = False
+        try:
+            dt1 = datetime.strptime(first_s, "%Y-%m-%d %H:%M:%S")
+            dt2 = datetime.strptime(last_s, "%Y-%m-%d %H:%M:%S")
+            dur_mins = max(int((dt2 - dt1).total_seconds() / 60), 0)
+            diff_now = (now - dt2).total_seconds()
+            is_online = diff_now <= 90
+        except Exception:
+            pass
+        
+        dur_str = f"{dur_mins // 60}h {dur_mins % 60}m" if dur_mins >= 60 else f"{dur_mins}m"
+        results.append({
+            "id": aid,
+            "prn": prn,
+            "name": name,
+            "batch": bat,
+            "department": dept,
+            "year": yr,
+            "division": div,
+            "mac_address": mac,
+            "ip_address": ip,
+            "date": adate,
+            "first_seen": first_s,
+            "last_seen": last_s,
+            "duration_minutes": dur_mins,
+            "duration_formatted": dur_str,
+            "connections": count,
+            "status": status,
+            "is_online": is_online
+        })
+    return results
+
+@app.get("/api/attendance/stats")
+def get_attendance_stats(date: Optional[str] = None):
+    attendance_date = date or datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        total_students = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0] or 0
+        present_count = conn.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date=?", (attendance_date,)).fetchone()[0] or 0
+        batches = conn.execute("SELECT DISTINCT batch FROM students ORDER BY batch").fetchall()
+        batch_list = [b[0] for b in batches if b[0]]
+        batches_by_year = _get_year_batches()
+        
+        active_now = 0
+        today_att = conn.execute("SELECT last_seen FROM attendance WHERE attendance_date=?", (attendance_date,)).fetchall()
+        now = datetime.now()
+        for r in today_att:
+            try:
+                dt = datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S")
+                if (now - dt).total_seconds() <= 90:
+                    active_now += 1
+            except Exception:
+                pass
+
+    rate = round((present_count / total_students * 100), 1) if total_students > 0 else 0
+    return {
+        "date": attendance_date,
+        "total_registered": total_students,
+        "present_today": present_count,
+        "active_now": active_now,
+        "attendance_rate": rate,
+        "batches": batch_list,
+        "batches_by_year": batches_by_year
+    }
+
+@app.post("/api/attendance/checkin")
+def manual_attendance_checkin(req: ManualCheckInRequest):
+    prn = req.prn.strip()
+    status = req.status or "Present"
+    date_str = req.date or datetime.now().strftime("%Y-%m-%d")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        stu = conn.execute("SELECT mac_address, prn, name, batch, COALESCE(department,''), COALESCE(year,''), COALESCE(division,'') FROM students WHERE prn=?", (prn,)).fetchone()
+        if not stu:
+            raise HTTPException(404, f"Student with PRN '{prn}' not found.")
+        mac, prn, name, batch, dept, yr, div = stu
+        conn.execute("""
+            INSERT INTO attendance
+                (mac_address, prn, student_name, batch, department, year, division, attendance_date, first_seen, last_seen, connection_count, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(mac_address, attendance_date) DO UPDATE SET
+                status = excluded.status,
+                last_seen = excluded.last_seen,
+                connection_count = attendance.connection_count + 1
+        """, (mac, prn, name, batch, dept, yr, div, date_str, now_str, now_str, status))
+
+    return {"status": "ok", "message": f"Attendance marked for {name} ({prn}) on {date_str} as {status}."}
+
+@app.delete("/api/attendance/{record_id}")
+def delete_attendance_record(record_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM attendance WHERE id=?", (record_id,))
+    return {"status": "ok", "message": "Attendance record deleted."}
+
+@app.get("/api/connected-devices")
+def get_connected_devices():
+    """Returns real-time discovered connected devices from ARP and devices table, with student link status."""
+    engine.scan_connected_devices()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT d.ip, d.custom_name, d.auto_name, d.device_type, d.first_seen, d.last_seen, COALESCE(d.mac_address, '') 
+        FROM devices d 
+        WHERE d.ip LIKE '192.168.137.%'
+           OR EXISTS (SELECT 1 FROM access_logs a WHERE a.client_ip = d.ip)
+           OR EXISTS (SELECT 1 FROM students s WHERE s.mac_address = d.mac_address)
+        ORDER BY d.last_seen DESC
+    """)
+    rows = c.fetchall()
+
+    c.execute("SELECT mac_address, prn, name, batch, COALESCE(department,''), COALESCE(year,''), COALESCE(division,'') FROM students")
+    student_map = {r[0].lower(): {"prn": r[1], "name": r[2], "batch": r[3], "department": r[4], "year": r[5], "division": r[6]} for r in c.fetchall()}
+    conn.close()
+
+    result = []
+    for ip, cname, aname, dtype, first_s, last_s, mac in rows:
+        liveness, sec = calculate_device_liveness(last_s)
+        stu = student_map.get(mac.lower()) if mac else None
+        result.append({
+            "ip": ip,
+            "mac": mac,
+            "name": cname or aname,
+            "device_type": dtype or "mobile",
+            "first_seen": first_s,
+            "last_seen": last_s,
+            "liveness": liveness,
+            "seconds_ago": sec,
+            "is_online": liveness == "Online",
+            "student": stu
+        })
+    return result
 
 @app.get("/api/students")
 def get_students():
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT prn, name, batch, registered_at FROM students ORDER BY name COLLATE NOCASE").fetchall()
-    return [{"prn": r[0], "name": r[1], "batch": r[2], "registered_at": r[3]} for r in rows]
+        rows = conn.execute("SELECT prn, name, batch, mac_address, registered_at, COALESCE(department,''), COALESCE(year,''), COALESCE(division,'') FROM students ORDER BY name COLLATE NOCASE").fetchall()
+    return [{"prn": r[0], "name": r[1], "batch": r[2], "mac_address": r[3], "registered_at": r[4],
+             "department": r[5], "year": r[6], "division": r[7]} for r in rows]
 
 @app.post("/api/students")
 def admin_register_student(req: StudentAdminRegistrationRequest):
     mac = req.mac_address.strip().replace("-", ":").lower()
     if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac):
         raise HTTPException(422, "Enter a MAC address in the format AA:BB:CC:DD:EE:FF.")
-    prn, name, batch = req.prn.strip(), req.name.strip(), req.batch.strip()
-    if not 2 <= len(prn) <= 40:
-        raise HTTPException(422, "Enter a valid PRN (2–40 characters).")
-    if not 2 <= len(name) <= 100:
-        raise HTTPException(422, "Enter a name (2–100 characters).")
-    if not 1 <= len(batch) <= 50:
-        raise HTTPException(422, "Enter a batch (up to 50 characters).")
+    prn, name = req.prn.strip(), req.name.strip()
+    department, year = req.department.strip(), req.year.strip()
+    division, batch = req.division.strip(), req.batch.strip()
+    _validate_student_fields(prn, name, department, year, division, batch)
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("""
-                INSERT INTO students (mac_address, prn, name, batch, registered_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO students (mac_address, prn, name, department, year, division, batch, registered_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(mac_address) DO UPDATE SET
-                    prn=excluded.prn, name=excluded.name, batch=excluded.batch,
+                    prn=excluded.prn, name=excluded.name, department=excluded.department,
+                    year=excluded.year, division=excluded.division, batch=excluded.batch,
                     registered_at=excluded.registered_at
-            """, (mac, prn, name, batch, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            """, (mac, prn, name, department, year, division, batch, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "That PRN is already registered to a different MAC address.")
-    return {"status": "ok", "message": f"{name} ({prn}) registered for {mac}. Attendance will be recorded on the next proxy activity."}
+    
+    # Check if this device is currently online and record attendance immediately
+    student_obj = {"mac_address": mac, "prn": prn, "name": name, "batch": batch,
+                   "department": department, "year": year, "division": division}
+    engine.record_attendance(student_obj)
+    return {"status": "ok", "message": f"{name} ({prn}) registered for {mac}. Attendance has been updated."}
+
+@app.put("/api/students/{mac}")
+def update_student(mac: str, req: StudentUpdateRequest):
+    """Edit a registered student's details. The student is identified by the linked device MAC."""
+    mac = mac.strip().replace("-", ":").lower()
+    if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac):
+        raise HTTPException(422, "Invalid MAC address.")
+    prn, name = req.prn.strip(), req.name.strip()
+    department, year = req.department.strip(), req.year.strip()
+    division, batch = req.division.strip(), req.batch.strip()
+    _validate_student_fields(prn, name, department, year, division, batch)
+
+    att_date = req.date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(att_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Date must use YYYY-MM-DD format.")
+
+    try:
+        with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+            clash = conn.execute("SELECT mac_address FROM students WHERE prn=? AND mac_address!=?", (prn, mac)).fetchone()
+            if clash:
+                raise HTTPException(409, f"PRN '{prn}' already belongs to another student ({clash[0]}).")
+            exists = conn.execute("SELECT 1 FROM students WHERE mac_address=?", (mac,)).fetchone()
+            if exists:
+                conn.execute("""UPDATE students SET prn=?, name=?, department=?, year=?, division=?, batch=?
+                                WHERE mac_address=?""", (prn, name, department, year, division, batch, mac))
+            else:
+                # Attendance row exists but the student record was deleted earlier - recreate it
+                conn.execute("""INSERT INTO students (mac_address, prn, name, department, year, division, batch, registered_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                             (mac, prn, name, department, year, division, batch, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+            if req.apply_to_history:
+                cur = conn.execute("""UPDATE attendance SET prn=?, student_name=?, department=?, year=?, division=?, batch=?
+                                      WHERE mac_address=?""", (prn, name, department, year, division, batch, mac))
+            else:
+                cur = conn.execute("""UPDATE attendance SET prn=?, student_name=?, department=?, year=?, division=?, batch=?
+                                      WHERE mac_address=? AND attendance_date=?""", (prn, name, department, year, division, batch, mac, att_date))
+            updated_rows = cur.rowcount
+
+            # Keep the device card name in sync when it is named after the student
+            new_dev_name = f"{name}'s Device"
+            ips = [r[0] for r in conn.execute(
+                "SELECT ip FROM devices WHERE mac_address=? AND name_source='student' AND COALESCE(custom_name,'')=''", (mac,))]
+            for ip in ips:
+                conn.execute("UPDATE devices SET auto_name=? WHERE ip=?", (new_dev_name, ip))
+                conn.execute("UPDATE access_logs SET device_name=? WHERE client_ip=?", (new_dev_name, ip))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"PRN '{prn}' is already in use.")
+
+    return {"status": "ok", "message": f"{name} ({prn}) updated — {updated_rows} attendance record(s) refreshed."}
+
+@app.delete("/api/students/{prn}")
+def delete_student(prn: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM students WHERE prn=?", (prn.strip(),))
+    return {"status": "ok", "message": f"Student with PRN {prn} deleted."}
+
+# ─── AI Analytics & Machine Learning Dataset Export ──────────
+CATEGORY_ENCODING = {
+    'Academic & Learning': 1,
+    'Entertainment & Social': 2,
+    'Gaming & Arcade': 3,
+    'Search & Knowledge': 4,
+    'Messaging & Collab': 5,
+    'Cloud & Infrastructure': 6,
+    'Proxy & Bypass': 7,
+    'Shopping & Services': 8,
+    'General Web': 9
+}
+
+DEVICE_TYPE_ENCODING = {
+    'desktop': 1,
+    'mobile': 2,
+    'tablet': 3,
+    'laptop': 4
+}
+
+METHOD_ENCODING = {
+    'GET': 1,
+    'POST': 2,
+    'CONNECT': 3,
+    'PUT': 4,
+    'DELETE': 5,
+    'HEAD': 6
+}
+
+RISK_ENCODING = {
+    'Normal': 0,
+    'Low': 1,
+    'Policy Violation': 2,
+    'Restricted Gaming': 2,
+    'Bypass Attempt': 3
+}
+
+@app.get("/api/export/schema")
+def get_export_schema():
+    """Returns documentation and attribute definitions for the AI dataset exporter."""
+    return {
+        "datasets": {
+            "traffic_features": {
+                "name": "Network Traffic ML Feature Matrix",
+                "description": "Pre-engineered numerical and categorical features extracted from network access logs for anomaly detection, intrusion classification, and traffic category prediction.",
+                "attributes": [
+                    {"name": "log_id", "type": "int", "role": "identifier", "description": "Sequential unique entry identifier"},
+                    {"name": "timestamp", "type": "string", "role": "temporal", "description": "ISO-8601 formatted event timestamp"},
+                    {"name": "epoch_time", "type": "float", "role": "temporal", "description": "Unix timestamp in seconds for continuous time-series modeling"},
+                    {"name": "hour_of_day", "type": "int", "role": "cyclical", "description": "Hour of event (0–23)"},
+                    {"name": "day_of_week", "type": "int", "role": "cyclical", "description": "Day of week (0=Monday, 6=Sunday)"},
+                    {"name": "is_weekend", "type": "binary", "role": "feature", "description": "1 if Saturday/Sunday, else 0"},
+                    {"name": "is_academic_hours", "type": "binary", "role": "feature", "description": "1 if weekday between 09:00 and 17:00, else 0"},
+                    {"name": "client_ip", "type": "string", "role": "categorical", "description": "Client IP address"},
+                    {"name": "client_mac", "type": "string", "role": "categorical", "description": "Resolved physical MAC address of device"},
+                    {"name": "device_name", "type": "string", "role": "metadata", "description": "Human-readable or auto-detected device name"},
+                    {"name": "device_type", "type": "string", "role": "categorical", "description": "Device category (mobile, desktop, tablet, etc.)"},
+                    {"name": "device_type_code", "type": "int", "role": "feature", "description": "Ordinal encoded device type integer (1=desktop, 2=mobile, 3=tablet, 4=laptop)"},
+                    {"name": "student_prn", "type": "string", "role": "label", "description": "Associated student PRN or UNREGISTERED"},
+                    {"name": "student_batch", "type": "string", "role": "categorical", "description": "Student academic batch or NONE"},
+                    {"name": "domain", "type": "string", "role": "text", "description": "Target hostname accessed by device"},
+                    {"name": "clean_site", "type": "string", "role": "categorical", "description": "Normalized root service or brand domain"},
+                    {"name": "domain_length", "type": "int", "role": "feature", "description": "Character length of target domain string"},
+                    {"name": "subdomain_count", "type": "int", "role": "feature", "description": "Count of sub-levels / dots in domain name"},
+                    {"name": "method", "type": "string", "role": "categorical", "description": "HTTP method (GET, POST, CONNECT)"},
+                    {"name": "method_code", "type": "int", "role": "feature", "description": "Encoded method integer (1=GET, 2=POST, 3=CONNECT)"},
+                    {"name": "category", "type": "string", "role": "label", "description": "Domain behavioral classification"},
+                    {"name": "category_code", "type": "int", "role": "target", "description": "Ordinal integer label (1=Academic, 2=Social, 3=Gaming, etc.)"},
+                    {"name": "is_background", "type": "binary", "role": "feature", "description": "1 if background OS telemetry/ad, 0 if user-initiated browsing"},
+                    {"name": "bytes_transferred", "type": "int", "role": "continuous", "description": "Total bytes transferred in this transaction"},
+                    {"name": "log_bytes", "type": "float", "role": "continuous", "description": "log(bytes + 1) normalized scale for neural networks & regression"},
+                    {"name": "status", "type": "string", "role": "categorical", "description": "Policy decision: Allowed or Blocked"},
+                    {"name": "status_code", "type": "binary", "role": "feature", "description": "1 if Allowed, 0 if Blocked"},
+                    {"name": "risk_flag", "type": "string", "role": "categorical", "description": "Threat assessment flag (Normal, Policy Violation, Bypass Attempt)"},
+                    {"name": "risk_score", "type": "int", "role": "feature", "description": "Numeric risk scale (0=Normal, 1=Low, 2=Medium, 3=High)"},
+                    {"name": "is_anomaly", "type": "binary", "role": "target", "description": "1 if event is anomalous or blocked, 0 if normal"}
+                ]
+            },
+            "device_profiles": {
+                "name": "Device Behavioral Feature Vectors",
+                "description": "Aggregated per-device statistics for unsupervised clustering (K-Means, DBSCAN) and device profiling.",
+                "attributes": [
+                    {"name": "client_ip", "type": "string", "role": "identifier", "description": "Device IP address"},
+                    {"name": "client_mac", "type": "string", "role": "identifier", "description": "Physical MAC address"},
+                    {"name": "device_name", "type": "string", "role": "metadata", "description": "Device name"},
+                    {"name": "device_type", "type": "string", "role": "categorical", "description": "Device type"},
+                    {"name": "student_prn", "type": "string", "role": "metadata", "description": "Linked student PRN"},
+                    {"name": "total_visits", "type": "int", "role": "continuous", "description": "Total website requests recorded"},
+                    {"name": "total_mb_used", "type": "float", "role": "continuous", "description": "Total bandwidth consumed in MB"},
+                    {"name": "avg_bytes_per_visit", "type": "float", "role": "continuous", "description": "Average payload size per visit"},
+                    {"name": "unique_domains_visited", "type": "int", "role": "continuous", "description": "Domain diversity count"},
+                    {"name": "academic_ratio", "type": "float", "role": "feature", "description": "Proportion of requests in Academic category (0.0–1.0)"},
+                    {"name": "entertainment_ratio", "type": "float", "role": "feature", "description": "Proportion of requests in Entertainment category (0.0–1.0)"},
+                    {"name": "gaming_ratio", "type": "float", "role": "feature", "description": "Proportion of requests in Gaming category (0.0–1.0)"},
+                    {"name": "blocked_ratio", "type": "float", "role": "feature", "description": "Ratio of blocked requests to total requests"},
+                    {"name": "blocked_count", "type": "int", "role": "feature", "description": "Total policy violations blocked"},
+                    {"name": "threat_level", "type": "string", "role": "target", "description": "Synthesized risk classification (Low, Medium, High)"}
+                ]
+            },
+            "attendance_ml": {
+                "name": "Student Attendance & Network Engagement Dataset",
+                "description": "Structured attendance timestamps and network liveness metrics for student punctuality and engagement AI models.",
+                "attributes": [
+                    {"name": "attendance_id", "type": "int", "role": "identifier", "description": "Record ID"},
+                    {"name": "prn", "type": "string", "role": "identifier", "description": "Student PRN"},
+                    {"name": "student_name", "type": "string", "role": "metadata", "description": "Full student name"},
+                    {"name": "batch", "type": "string", "role": "categorical", "description": "Academic division / batch"},
+                    {"name": "mac_address", "type": "string", "role": "metadata", "description": "Recognized device MAC"},
+                    {"name": "ip_address", "type": "string", "role": "metadata", "description": "Assigned device IP"},
+                    {"name": "attendance_date", "type": "string", "role": "temporal", "description": "Date of attendance (YYYY-MM-DD)"},
+                    {"name": "check_in_time", "type": "string", "role": "temporal", "description": "First connection time of day"},
+                    {"name": "last_active_time", "type": "string", "role": "temporal", "description": "Most recent connection time"},
+                    {"name": "check_in_hour", "type": "float", "role": "continuous", "description": "Decimal hour of check-in (e.g. 9.5 for 09:30)"},
+                    {"name": "duration_minutes", "type": "int", "role": "continuous", "description": "Total duration on network in minutes"},
+                    {"name": "connection_count", "type": "int", "role": "continuous", "description": "Number of proxy network handshakes"},
+                    {"name": "is_punctual", "type": "binary", "role": "target", "description": "1 if checked in before 09:30 AM, else 0"},
+                    {"name": "status", "type": "string", "role": "label", "description": "Attendance status (Present, Late, Active)"}
+                ]
+            }
+        }
+    }
+
+@app.get("/api/export/ai-dataset")
+def export_ai_dataset(
+    type: str = "traffic_features",
+    format: str = "csv",
+    limit: int = 5000,
+    mode: str = "clean",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """
+    Exports collected and stored network telemetry into curated datasets with engineered
+    attributes and numerical encodings tailored for Machine Learning and AI analysis.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Pre-load student mapping by MAC & IP
+    c.execute("SELECT mac_address, prn, name, batch FROM students")
+    mac_to_student = {r[0].lower(): {"prn": r[1], "name": r[2], "batch": r[3]} for r in c.fetchall()}
+    c.execute("SELECT ip, COALESCE(mac_address,'') FROM devices")
+    ip_to_mac = {r[0]: r[1].lower() for r in c.fetchall()}
+
+    records = []
+    filename_prefix = f"netplus_{type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    if type == "traffic_features" or type == "raw_logs":
+        conditions = []
+        params = []
+        if mode == "clean" and type == "traffic_features":
+            conditions.append("is_background = 0")
+        if start_date:
+            conditions.append("timestamp >= ?")
+            params.append(f"{start_date} 00:00:00")
+        if end_date:
+            conditions.append("timestamp <= ?")
+            params.append(f"{end_date} 23:59:59")
+        
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        lim_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
+
+        c.execute(f"""
+            SELECT id, timestamp, client_ip, device_name, device_type, domain, clean_site,
+                   is_background, category, method, bytes_transferred, status, risk_flag, user_agent
+            FROM access_logs {where} ORDER BY id DESC {lim_clause}
+        """, params)
+        rows = c.fetchall()
+
+        for r in rows:
+            lid, ts, ip, dev_name, dev_type, dom, csite, is_bg, cat, meth, b_trans, stat, r_flag, ua = r
+            
+            # Feature engineering
+            mac = ip_to_mac.get(ip, '')
+            stu = mac_to_student.get(mac, {}) if mac else {}
+            
+            epoch = 0.0
+            hour = 0
+            dow = 0
+            is_wknd = 0
+            is_acad_hours = 0
+            try:
+                dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                epoch = dt.timestamp()
+                hour = dt.hour
+                dow = dt.weekday()
+                is_wknd = 1 if dow >= 5 else 0
+                is_acad_hours = 1 if (dow < 5 and 9 <= hour <= 17) else 0
+            except Exception:
+                pass
+
+            bytes_val = b_trans or 0
+            log_b = round(math.log1p(bytes_val), 4)
+            d_len = len(dom or '')
+            sub_count = (dom or '').count('.')
+            meth_upper = (meth or 'GET').upper()
+            meth_code = METHOD_ENCODING.get(meth_upper, 0)
+            dev_type_str = (dev_type or 'mobile').lower()
+            dev_type_code = DEVICE_TYPE_ENCODING.get(dev_type_str, 2)
+            cat_code = CATEGORY_ENCODING.get(cat, 9)
+            stat_code = 1 if stat == 'Allowed' else 0
+            r_score = RISK_ENCODING.get(r_flag, 0)
+            if stat == 'Blocked':
+                r_score = max(r_score, 2)
+            is_anomaly = 1 if (r_score > 0 or stat == 'Blocked') else 0
+
+            if type == "traffic_features":
+                records.append({
+                    "log_id": lid,
+                    "timestamp": ts,
+                    "epoch_time": epoch,
+                    "hour_of_day": hour,
+                    "day_of_week": dow,
+                    "is_weekend": is_wknd,
+                    "is_academic_hours": is_acad_hours,
+                    "client_ip": ip,
+                    "client_mac": mac or "UNKNOWN",
+                    "device_name": dev_name,
+                    "device_type": dev_type_str,
+                    "device_type_code": dev_type_code,
+                    "student_prn": stu.get("prn", "UNREGISTERED"),
+                    "student_batch": stu.get("batch", "NONE"),
+                    "domain": dom,
+                    "clean_site": csite or dom,
+                    "domain_length": d_len,
+                    "subdomain_count": sub_count,
+                    "method": meth_upper,
+                    "method_code": meth_code,
+                    "category": cat,
+                    "category_code": cat_code,
+                    "is_background": is_bg,
+                    "bytes_transferred": bytes_val,
+                    "log_bytes": log_b,
+                    "status": stat,
+                    "status_code": stat_code,
+                    "risk_flag": r_flag,
+                    "risk_score": r_score,
+                    "is_anomaly": is_anomaly
+                })
+            else: # raw_logs
+                records.append({
+                    "id": lid,
+                    "timestamp": ts,
+                    "client_ip": ip,
+                    "device_name": dev_name,
+                    "device_type": dev_type,
+                    "domain": dom,
+                    "clean_site": csite,
+                    "is_background": is_bg,
+                    "category": cat,
+                    "method": meth,
+                    "bytes_transferred": bytes_val,
+                    "status": stat,
+                    "risk_flag": r_flag,
+                    "user_agent": ua
+                })
+
+    elif type == "device_profiles":
+        c.execute("""
+            SELECT d.ip, COALESCE(NULLIF(d.custom_name,''), d.auto_name, 'Device'), d.device_type,
+                   COUNT(a.id) as total_reqs,
+                   COALESCE(SUM(a.bytes_transferred), 0) as total_bytes,
+                   COUNT(DISTINCT a.clean_site) as unique_sites,
+                   COALESCE(SUM(CASE WHEN a.category = 'Academic & Learning' THEN 1 ELSE 0 END), 0) as acad_count,
+                   COALESCE(SUM(CASE WHEN a.category = 'Entertainment & Social' THEN 1 ELSE 0 END), 0) as ent_count,
+                   COALESCE(SUM(CASE WHEN a.category = 'Gaming & Arcade' THEN 1 ELSE 0 END), 0) as game_count,
+                   COALESCE(SUM(CASE WHEN a.status = 'Blocked' THEN 1 ELSE 0 END), 0) as blocked_cnt
+            FROM devices d
+            LEFT JOIN access_logs a ON a.client_ip = d.ip
+            WHERE d.ip LIKE '192.168.137.%'
+               OR a.id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM students s WHERE s.mac_address = d.mac_address)
+            GROUP BY d.ip
+            ORDER BY total_reqs DESC, d.last_seen DESC
+        """)
+        dev_rows = c.fetchall()
+
+        for r in dev_rows:
+            ip, dname, dtype, total_r, total_b, uniq_sites, acad_c, ent_c, game_c, blk_c = r
+            mac = ip_to_mac.get(ip, '')
+            stu = mac_to_student.get(mac, {}) if mac else {}
+            
+            total_r = max(total_r, 1)
+            mb = round(total_b / (1024 * 1024), 2)
+            avg_b = round(total_b / total_r, 1)
+            acad_ratio = round(acad_c / total_r, 3)
+            ent_ratio = round(ent_c / total_r, 3)
+            game_ratio = round(game_c / total_r, 3)
+            blk_ratio = round(blk_c / total_r, 3)
+            
+            threat = "Low"
+            if blk_c > 5 or game_ratio > 0.4:
+                threat = "High"
+            elif blk_c > 0 or game_ratio > 0.2:
+                threat = "Medium"
+
+            records.append({
+                "client_ip": ip,
+                "client_mac": mac or "UNKNOWN",
+                "device_name": dname,
+                "device_type": dtype or "mobile",
+                "student_prn": stu.get("prn", "UNREGISTERED"),
+                "student_name": stu.get("name", "N/A"),
+                "total_visits": total_r,
+                "total_mb_used": mb,
+                "avg_bytes_per_visit": avg_b,
+                "unique_domains_visited": uniq_sites,
+                "academic_ratio": acad_ratio,
+                "entertainment_ratio": ent_ratio,
+                "gaming_ratio": game_ratio,
+                "blocked_ratio": blk_ratio,
+                "blocked_count": blk_c,
+                "threat_level": threat
+            })
+
+    elif type == "attendance_ml":
+        c.execute("""
+            SELECT id, prn, student_name, batch, mac_address, COALESCE(ip_address,''),
+                   attendance_date, first_seen, last_seen, connection_count, COALESCE(status, 'Present'),
+                   COALESCE(department,''), COALESCE(year,''), COALESCE(division,'')
+            FROM attendance ORDER BY attendance_date DESC, first_seen ASC
+        """)
+        att_rows = c.fetchall()
+        for r in att_rows:
+            aid, prn, name, bat, mac, ip, adate, first_s, last_s, count, status, dept, yr, div = r
+            dur_mins = 0
+            check_in_hour = 0.0
+            is_punctual = 1
+            try:
+                dt1 = datetime.strptime(first_s, "%Y-%m-%d %H:%M:%S")
+                dt2 = datetime.strptime(last_s, "%Y-%m-%d %H:%M:%S")
+                dur_mins = max(int((dt2 - dt1).total_seconds() / 60), 0)
+                check_in_hour = round(dt1.hour + dt1.minute / 60.0, 2)
+                # Punctual if before 09:30 AM
+                is_punctual = 1 if (dt1.hour < 9 or (dt1.hour == 9 and dt1.minute <= 30)) else 0
+            except Exception:
+                pass
+
+            records.append({
+                "attendance_id": aid,
+                "prn": prn,
+                "student_name": name,
+                "department": dept,
+                "year": yr,
+                "division": div,
+                "batch": bat,
+                "mac_address": mac,
+                "ip_address": ip or "UNKNOWN",
+                "attendance_date": adate,
+                "check_in_time": first_s,
+                "last_active_time": last_s,
+                "check_in_hour": check_in_hour,
+                "duration_minutes": dur_mins,
+                "connection_count": count,
+                "is_punctual": is_punctual,
+                "status": status
+            })
+
+    conn.close()
+
+    # Format output
+    if format == "json":
+        json_data = json.dumps(records, indent=2)
+        return Response(
+            content=json_data,
+            media_type="application/json",
+            headers={"Content-Disposition": f"attachment; filename={filename_prefix}.json"}
+        )
+    else: # CSV format
+        output = io.StringIO()
+        if records:
+            writer = csv.DictWriter(output, fieldnames=list(records[0].keys()), quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            writer.writerows(records)
+        else:
+            output.write("No records found for the specified criteria.")
+        
+        csv_data = output.getvalue()
+        return Response(
+            content=csv_data,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename_prefix}.csv"}
+        )
 
 # ─── Devices ──────────────────────────────────────────────────
 @app.get("/api/devices")
 def get_devices(mode: str = "clean"):
-    try:
-        engine.scan_hotspot_devices()
-    except Exception:
-        pass
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT ip, custom_name, auto_name, device_type, first_seen, last_seen FROM devices ORDER BY last_seen DESC")
+    c.execute("SELECT ip, custom_name, auto_name, device_type, first_seen, last_seen, COALESCE(mac_address, '') FROM devices ORDER BY last_seen DESC")
     device_rows = c.fetchall()
 
     bg_filter = "AND is_background = 0" if mode == "clean" else ""
     site_col  = "clean_site" if mode == "clean" else "domain"
     devices_list = []
 
-    for ip, custom_name, auto_name, device_type, first_seen, last_seen in device_rows:
+    for ip, custom_name, auto_name, device_type, first_seen, last_seen, dev_mac in device_rows:
         c.execute(f"""
             SELECT COUNT(*), COALESCE(SUM(bytes_transferred),0),
                    SUM(CASE WHEN status='Blocked' THEN 1 ELSE 0 END),
@@ -407,6 +1105,12 @@ def get_devices(mode: str = "clean"):
         dev_blocked = st[2] or 0; latest_ts = st[3] or last_seen
 
         liveness, seconds_ago = calculate_device_liveness(latest_ts)
+
+        # Ignore unverified devices that have no requests and are not on the hotspot or registered to a student
+        if dev_req == 0 and not ip.startswith("192.168.137."):
+            c.execute("SELECT 1 FROM students WHERE mac_address=(SELECT mac_address FROM devices WHERE ip=?)", (ip,))
+            if not c.fetchone():
+                continue
 
         c.execute(f"""
             SELECT {site_col}, COUNT(*), COALESCE(SUM(bytes_transferred),0)
@@ -426,6 +1130,7 @@ def get_devices(mode: str = "clean"):
 
         devices_list.append({
             "ip": ip,
+            "mac": dev_mac,
             "name": custom_name or auto_name,
             "device_type": device_type or "mobile",
             "first_seen": first_seen,
@@ -507,6 +1212,21 @@ def rename_device(ip: str, req: RenameRequest):
     if not name: raise HTTPException(400, "Name cannot be empty")
     engine.rename_device(ip, name)
     return {"status": "ok", "message": f"Renamed to '{name}'"}
+
+# ─── Device removal / history clearing ────────────────────────
+@app.delete("/api/devices/{ip}/history")
+def clear_device_history(ip: str):
+    """Delete this device's browsing history but keep the device card."""
+    deleted = engine.clear_device_history(ip)
+    return {"status": "ok", "deleted": deleted, "message": f"Cleared {deleted:,} history record(s) for {ip}."}
+
+@app.delete("/api/devices/{ip}")
+def remove_device(ip: str):
+    """Remove the device entirely (card + history + quota). Student/attendance data is kept."""
+    found, deleted = engine.remove_device(ip)
+    if not found and not deleted:
+        raise HTTPException(404, "Device not found.")
+    return {"status": "ok", "deleted": deleted, "message": f"Device {ip} removed ({deleted:,} history record(s) deleted)."}
 
 # ─── Logs ─────────────────────────────────────────────────────
 @app.get("/api/logs")
@@ -772,7 +1492,9 @@ def generate_report(mode: str = "clean", date_from: Optional[str] = None, date_t
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    engine.register_ws(websocket)
+    import asyncio
+    loop = asyncio.get_running_loop()
+    engine.register_ws(websocket, loop)
     try:
         while True:
             await websocket.receive_text()

@@ -61,6 +61,8 @@ NetPlus turns your Windows PC into a full network monitoring gateway. Any phone,
 | Mobile Responsive | Works on tablet and mobile browser |
 | Device Matrix Grid | Cards per device with liveness badge, top sites, quota bar |
 | Device Drilldown Modal | Full history, sessions, top sites, quota per device |
+| Real Device Names | Shows the device's own hostname (e.g. `Galaxy-A51`, `Rahuls-iPhone`); falls back to the exact phone model from the User-Agent, then a stable `Unidentified Device (AB:CD)` label — never a random name. Linked students show as `<Student>'s Device`. A name you set with ✏️ Rename is never overwritten |
+| Remove Device / Clear History | 🧹 clears one device's browsing history (device stays); 🗑 removes the device, its history and quota (`DELETE /api/devices/{ip}[/history]`). Student and attendance data are kept. A removed device is not re-added by the background scan; it returns only if it browses through the proxy again |
 | HTML Audit Report | Download printable report with all device stats |
 | CSV Log Export | Full log export |
 | Browser Notifications | Desktop alert when blocked site attempted |
@@ -69,10 +71,13 @@ NetPlus turns your Windows PC into a full network monitoring gateway. Any phone,
 ### Student Attendance
 | Feature | Description |
 |---------|-------------|
-| First-use Student Registration | First plain HTTP visit redirects an unregistered hotspot device to a PRN, name, and batch form |
+| First-use Student Registration | First plain HTTP visit redirects an unregistered hotspot device to a join form (PRN, Name, Department, Year, Div, Batch). The redirect happens **only once per device** (remembered across restarts); admins can re-enable it with `POST /api/attendance/prompts/reset` |
+| Year-wise Batches | Each academic year (FE / SE / TE / BE) has its own batch list. Choosing a Year narrows the Batch dropdown; admins can add batches from the Register Student modal (`/api/academic/batches`) |
+| Student Dropdowns | Department, Year, Div and Batch are dropdowns (validated server-side); attendance ledger shows and filters by all of them |
 | MAC-based Daily Check-in | Windows hotspot neighbor table associates the device IP with its MAC; known devices are checked in on proxy activity, once per calendar day |
 | Attendance Dashboard | View daily attendance, batch, first seen, last seen, and proxy request count |
-| Admin Device Registration | Register or update a student's PRN, name, and batch against a MAC directly from the dashboard |
+| Edit Student Details | ✎ button on every attendance row (and on matched devices in the radar) opens the student form pre-filled; change PRN, name, department, year, division or batch (`PUT /api/students/{mac}`). Optionally corrects the student's past attendance rows too |
+| Admin Device Registration | Register or update a student's PRN, name, department, year, division and batch against a MAC directly from the dashboard |
 
 The gateway cannot launch a browser on a device. The registration redirect happens only after that device makes a plain HTTP request through the configured proxy; HTTPS CONNECT traffic cannot be redirected without TLS interception. Windows ARP lookup must be able to resolve the hotspot client's MAC. Devices using randomized MAC addresses must keep the same private address for this hotspot, or they may need to register again.
 

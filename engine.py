@@ -9,7 +9,8 @@ import sys
 import re
 import subprocess
 import secrets
-from datetime import datetime
+import queue
+from datetime import datetime, timedelta
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -18,8 +19,32 @@ except Exception:
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "network_logs.db")
 
+# ─── Academic structure (used by student registration dropdowns) ───
+DEPARTMENTS = [
+    "Computer Engineering",
+    "Information Technology",
+    "AI & Data Science",
+    "Electronics & Telecommunication",
+    "Mechanical Engineering",
+    "Civil Engineering",
+]
+YEARS = [
+    {"value": "FE", "label": "First Year (FE)"},
+    {"value": "SE", "label": "Second Year (SE)"},
+    {"value": "TE", "label": "Third Year (TE)"},
+    {"value": "BE", "label": "Final Year (BE)"},
+]
+DIVISIONS = ["A", "B", "C", "D", "E", "F"]
+# Year-wise batches seeded on first run. Admins can add/remove more from the dashboard.
+DEFAULT_YEAR_BATCHES = {y["value"]: [f"{y['value']}-B{i}" for i in range(1, 5)] for y in YEARS}
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except Exception:
+        pass
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS access_logs (
@@ -97,6 +122,32 @@ def init_db():
             UNIQUE(mac_address, attendance_date)
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS year_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year TEXT NOT NULL,
+            batch TEXT NOT NULL,
+            UNIQUE(year, batch)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS removed_devices (
+            device_key TEXT PRIMARY KEY,
+            removed_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS registration_prompts (
+            device_key TEXT PRIMARY KEY,
+            prompted_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute("SELECT COUNT(*) FROM year_batches")
+    if cursor.fetchone()[0] == 0:
+        cursor.executemany(
+            "INSERT OR IGNORE INTO year_batches (year, batch) VALUES (?, ?)",
+            [(yr, b) for yr, batches in DEFAULT_YEAR_BATCHES.items() for b in batches]
+        )
     cursor.execute("SELECT COUNT(*) FROM latency_targets")
     if cursor.fetchone()[0] == 0:
         cursor.executemany(
@@ -106,6 +157,29 @@ def init_db():
                 ('Cloudflare', 'one.one.one.one', 80),
             ]
         )
+    # Safe column additions if existing DB was created without them
+    try:
+        cursor.execute("ALTER TABLE devices ADD COLUMN mac_address TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE devices ADD COLUMN name_source TEXT DEFAULT ''")
+    except Exception:
+        pass
+    for tbl in ("students", "attendance"):
+        for col in ("department", "year", "division"):
+            try:
+                cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT DEFAULT ''")
+            except Exception:
+                pass
+    try:
+        cursor.execute("ALTER TABLE attendance ADD COLUMN ip_address TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE attendance ADD COLUMN status TEXT DEFAULT 'Present'")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -238,6 +312,19 @@ def parse_user_agent(ua_string):
     if 'macintosh' in ua or 'mac os x' in ua:
         return {"name": "MacBook / macOS", "type": "laptop", "os": "macOS"}
     if 'android' in ua:
+        model = _extract_android_model(ua_string)
+        if model:
+            if re.match(r'^sm-', model, re.I):
+                label = f"Samsung {model.upper()}"
+            elif re.match(r'^pixel', model, re.I):
+                label = f"Google {model}"
+            elif re.match(r'^(redmi|poco|mi |xiaomi)', model, re.I):
+                label = model
+            elif re.match(r'^(m\d{4}|\d{5}[a-z]{3,})', model, re.I):   # Xiaomi codes e.g. M2101K6I
+                label = f"Xiaomi {model}"
+            else:
+                label = model
+            return {"name": label, "type": "mobile", "os": f"Android{android_ver}"}
         if 'samsung' in ua or 'sm-' in ua:
             return {"name": f"Samsung Galaxy{android_ver}", "type": "mobile", "os": f"Android{android_ver}"}
         if 'pixel' in ua:
@@ -261,16 +348,53 @@ def parse_user_agent(ua_string):
         return {"name": "Linux PC", "type": "desktop", "os": "Linux"}
     return {"name": "Unknown Device", "type": "mobile", "os": "Unknown"}
 
+
+def _extract_android_model(ua_string):
+    """Pull the real handset model out of an Android UA, e.g. 'SM-A515F'.
+    Chrome's reduced UA reports just 'K' as the model - that is ignored."""
+    m = re.search(r'android [\d.]+;\s*([^;)]+?)(?:\s+build/[^;)]*)?\s*[;)]', ua_string or '', re.I)
+    if not m:
+        return ''
+    model = m.group(1).strip()
+    if len(model) < 3 or model.lower() in ('k', 'mobile', 'wv', 'linux', 'u', 'generic', 'android'):
+        return ''
+    return model
+
+# ─── Device naming ───
+# Higher number = better name. A name is only ever replaced by a better one.
+NAME_PRIORITY = {"": 0, "fallback": 1, "ua": 2, "host": 3, "student": 4, "system": 5}
+GENERIC_NAME_RE = re.compile(r"^(Hotspot Device|Mobile Device|Client Device|Unknown Device|Unidentified Device|Android Phone)", re.I)
+ONLINE_WINDOW_SEC = 120
+
+def clean_hostname(raw, own_hostname=""):
+    """Turn a DNS/NetBIOS answer into a presentable device name, or None if it is
+    just an IP, a random token, or the gateway PC's own name."""
+    if not raw:
+        return None
+    label = raw.strip().rstrip('.').split('.')[0].strip()
+    if len(label) < 2 or len(label) > 63:
+        return None
+    low = label.lower()
+    if low in ('localhost', 'unknown', 'gateway', 'router') or low == (own_hostname or '').lower():
+        return None
+    if re.fullmatch(r'[\d\-_]+', label):                      # 192-168-137-5
+        return None
+    if re.fullmatch(r'(android[-_]?)?[0-9a-f]{10,}', low):      # android-1a2b3c4d5e6f
+        return None
+    return label
+
+def fallback_device_name(ip, mac=""):
+    """Stable, non-random placeholder used only until a real name is found."""
+    if mac and re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac.lower()):
+        return f"Unidentified Device ({mac[-5:].upper()})"
+    return f"Unidentified Device (#{ip.split('.')[-1]})"
+
 class NetworkMonitoringEngine:
-    def __init__(self, host='0.0.0.0', port=None):
-        if port is None:
-            port = int(os.environ.get("NETPULSE_PROXY_PORT", 8088))
+    def __init__(self, host='0.0.0.0', port=8080):
         self.host = host
         self.port = port
-        self.host_display = '192.168.137.1'
-        self.active_ports = []
         self.running = False
-        self.server_sockets = []
+        self.server_socket = None
         self.blocked_domains = set()
         self.ws_subscribers = []
         self.lock = threading.Lock()
@@ -278,9 +402,24 @@ class NetworkMonitoringEngine:
         self._quota_cache_ts = 0
         self._mac_cache = {}
         self._registration_tokens = {}
+        self._prompted_keys = set()
+        self._removed_keys = set()
+        self._name_state = {}            # ip -> (last_try_ts, tries, done)
+        self._name_queue = queue.Queue()
+        self._name_workers_started = False
+        self._own_hostname = socket.gethostname()
         init_db()
+        self._load_prompted_keys()
+        self._load_removed_keys()
         self.load_blocklist()
         self._refresh_quota_cache()
+
+    def _load_prompted_keys(self):
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                self._prompted_keys = {r[0] for r in conn.execute("SELECT device_key FROM registration_prompts")}
+        except sqlite3.Error:
+            self._prompted_keys = set()
 
     def _refresh_quota_cache(self):
         try:
@@ -403,70 +542,316 @@ class NetworkMonitoringEngine:
 
     def get_or_create_device(self, ip, ua_string):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ua_info = parse_user_agent(ua_string)
+        ua_info = parse_user_agent(ua_string) if ua_string else None
+        ua_known = bool(ua_info) and not ua_info["name"].startswith(("Unknown Device", "Mobile Device"))
+        last_octet = ip.split('.')[-1]
+        mac = self.get_mac_for_ip(ip)
+
+        # A device that is genuinely sending traffic again is no longer "removed".
+        if self._removed_keys:
+            self._clear_removed(ip, mac)
 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT ip, custom_name, auto_name, device_type FROM devices WHERE ip = ?", (ip,))
+        c.execute("SELECT ip, custom_name, auto_name, device_type, COALESCE(name_source,'') FROM devices WHERE ip = ?", (ip,))
         row = c.fetchone()
 
         if row:
-            custom_name = row[1]
-            auto_name = row[2]
-            dev_type = row[3]
-            
-            if ua_string and ('Mobile Device' in auto_name or 'Client Device' in auto_name):
-                auto_name = f"{ua_info['name']} (#{ip.split('.')[-1]})"
+            custom_name, auto_name, dev_type, src = row[1], row[2], row[3], row[4]
+            if ua_known and NAME_PRIORITY["ua"] > self._stored_priority(auto_name, src):
+                auto_name = f"{ua_info['name']} (#{last_octet})"
                 dev_type = ua_info['type']
-                c.execute("UPDATE devices SET auto_name = ?, device_type = ?, last_seen = ? WHERE ip = ?", (auto_name, dev_type, timestamp, ip))
+                c.execute("UPDATE devices SET auto_name = ?, device_type = ?, name_source = 'ua', last_seen = ?, mac_address = COALESCE(NULLIF(?, ''), mac_address) WHERE ip = ?",
+                          (auto_name, dev_type, timestamp, mac or '', ip))
             else:
-                c.execute("UPDATE devices SET last_seen = ? WHERE ip = ?", (timestamp, ip))
-            
+                c.execute("UPDATE devices SET last_seen = ?, mac_address = COALESCE(NULLIF(?, ''), mac_address) WHERE ip = ?", (timestamp, mac or '', ip))
             conn.commit()
             conn.close()
-            return {
-                "ip": ip,
-                "name": custom_name or auto_name,
-                "device_type": dev_type
-            }
+            name = custom_name or auto_name
+            self._schedule_name_refresh(ip)
         else:
             if ip == '127.0.0.1':
-                auto_name = 'Host PC (Localhost)'
-                dev_type = 'desktop'
-            elif ip.startswith('192.168.137.'):
-                auto_name = f"{ua_info['name']} (#{ip.split('.')[-1]})"
-                dev_type = ua_info['type']
+                auto_name, dev_type, src = 'Host PC (Localhost)', 'desktop', 'system'
+            elif ua_known:
+                suffix = f"#{last_octet}" if ip.startswith('192.168.137.') else ip
+                auto_name, dev_type, src = f"{ua_info['name']} ({suffix})", ua_info['type'], 'ua'
             else:
-                auto_name = f"{ua_info['name']} ({ip})"
-                dev_type = ua_info['type']
-
-            c.execute("INSERT INTO devices (ip, custom_name, auto_name, device_type, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-                      (ip, '', auto_name, dev_type, timestamp, timestamp))
+                auto_name, dev_type, src = fallback_device_name(ip, mac or ''), (ua_info or {}).get('type', 'mobile'), 'fallback'
+            c.execute("INSERT INTO devices (ip, custom_name, auto_name, device_type, first_seen, last_seen, mac_address, name_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (ip, '', auto_name, dev_type, timestamp, timestamp, mac or '', src))
             conn.commit()
             conn.close()
-            return {
-                "ip": ip,
-                "name": auto_name,
-                "device_type": dev_type
-            }
+            name = auto_name
+            self._schedule_name_refresh(ip)
+
+        if mac:
+            stu = self.get_student_by_mac(mac)
+            if stu:
+                self.record_attendance(stu, ip=ip)
+
+        return {"ip": ip, "name": name, "device_type": dev_type}
+
+    # ── Device naming: hostname / student / model, upgraded in the background ──
+    def _stored_priority(self, name, source):
+        if source:
+            return NAME_PRIORITY.get(source, 0)
+        # Rows created before name_source existed
+        return 0 if (not name or GENERIC_NAME_RE.match(name)) else NAME_PRIORITY["ua"]
+
+    def resolve_hostname(self, ip):
+        """Ask the hotspot's DNS (ICS), then NetBIOS, then ping -a for the device's real hostname."""
+        if ip in ("127.0.0.1", "::1"):
+            return None
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            name = clean_hostname(socket.gethostbyaddr(ip)[0], self._own_hostname)
+            if name:
+                return name
+        except Exception:
+            pass
+        if os.name != "nt":
+            return None
+        try:   # NetBIOS (Windows laptops)
+            r = subprocess.run(["nbtstat", "-A", ip], capture_output=True, text=True, timeout=3, creationflags=flags)
+            m = re.search(r"^\s*([^\s<]+)\s+<00>\s+UNIQUE", r.stdout, re.M)
+            if m:
+                name = clean_hostname(m.group(1), self._own_hostname)
+                if name:
+                    return name
+        except Exception:
+            pass
+        try:   # Resolves through the same DNS cache the hotspot shows in Settings
+            r = subprocess.run(["ping", "-a", "-n", "1", "-w", "700", ip], capture_output=True, text=True, timeout=4, creationflags=flags)
+            m = re.search(r"Pinging\s+(\S+)\s+\[" + re.escape(ip) + r"\]", r.stdout)
+            if m:
+                return clean_hostname(m.group(1), self._own_hostname)
+        except Exception:
+            pass
+        return None
+
+    def refresh_device_name(self, ip):
+        """Work out the best available name for this device and store it if it beats the current one.
+        Returns True when the name is final (no need to keep retrying)."""
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(custom_name,''), COALESCE(auto_name,''), COALESCE(device_type,'mobile'), "
+                    "COALESCE(name_source,''), COALESCE(mac_address,''), COALESCE(last_seen,'') FROM devices WHERE ip=?", (ip,)
+                ).fetchone()
+                if not row:
+                    return True
+                custom, auto, dtype, src, mac, last_seen = row
+                cur_pri = self._stored_priority(auto, src)
+
+                ua_row = conn.execute(
+                    "SELECT user_agent FROM access_logs WHERE client_ip=? AND user_agent IS NOT NULL AND user_agent!='' ORDER BY id DESC LIMIT 1", (ip,)
+                ).fetchone()
+                ua_info = parse_user_agent(ua_row[0]) if ua_row else None
+                ua_known = bool(ua_info) and not ua_info["name"].startswith(("Unknown Device", "Mobile Device"))
+                if ua_info:
+                    dtype = ua_info["type"]
+
+                cand = None
+                student = self.get_student_by_mac(mac) if mac else None
+                if student:
+                    cand = (f"{student['name']}'s Device", "student")
+                else:
+                    online = False
+                    try:
+                        online = (datetime.now() - datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S")).total_seconds() <= ONLINE_WINDOW_SEC
+                    except Exception:
+                        pass
+                    host = self.resolve_hostname(ip) if online else None
+                    if host:
+                        cand = (host, "host")
+                    elif ua_known:
+                        suffix = f"#{ip.split('.')[-1]}" if ip.startswith('192.168.137.') else ip
+                        cand = (f"{ua_info['name']} ({suffix})", "ua")
+                    elif cur_pri == 0:
+                        cand = (fallback_device_name(ip, mac), "fallback")
+
+                if cand:
+                    name, source = cand
+                    better = NAME_PRIORITY[source] > cur_pri
+                    changed_same = NAME_PRIORITY[source] == cur_pri and source in ("host", "student") and name != auto
+                    if better or changed_same:
+                        conn.execute("UPDATE devices SET auto_name=?, device_type=?, name_source=? WHERE ip=?", (name, dtype, source, ip))
+                        if not custom:
+                            conn.execute("UPDATE access_logs SET device_name=? WHERE client_ip=?", (name, ip))
+                        auto, src = name, source
+                if custom:
+                    return True
+                return src in ("host", "student", "system")
+        except Exception as e:
+            print(f"Name refresh failed for {ip}: {e}")
+            return False
+
+    def _schedule_name_refresh(self, ip):
+        if not ip:
+            return
+        now = time.time()
+        st = self._name_state.get(ip)
+        if st and st[2]:
+            return
+        interval = 15 if (not st or st[1] < 4) else 300
+        if st and now - st[0] < interval:
+            return
+        self._name_state[ip] = (now, (st[1] + 1) if st else 1, False)
+        self._name_queue.put(ip)
+
+    def _name_worker_loop(self):
+        while self.running:
+            try:
+                ip = self._name_queue.get(timeout=2)
+            except queue.Empty:
+                continue
+            final = self.refresh_device_name(ip)
+            st = self._name_state.get(ip)
+            if st and final:
+                self._name_state[ip] = (st[0], st[1], True)
+
+    def _schedule_all_names(self):
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                ips = [r[0] for r in conn.execute("SELECT ip FROM devices")]
+            for ip in ips:
+                self._schedule_name_refresh(ip)
+        except sqlite3.Error:
+            pass
+
+    # ── "Removed device" tombstones: stop the ARP scanner re-adding a device the admin deleted ──
+    def _load_removed_keys(self):
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                self._removed_keys = {r[0] for r in conn.execute("SELECT device_key FROM removed_devices")}
+        except sqlite3.Error:
+            self._removed_keys = set()
+
+    def _is_removed(self, ip, mac):
+        return bool(self._removed_keys) and ((mac or ip or "").lower() in self._removed_keys)
+
+    def _clear_removed(self, ip, mac):
+        keys = {k for k in ((ip or "").lower(), (mac or "").lower()) if k and k in self._removed_keys}
+        if not keys:
+            return
+        self._removed_keys -= keys
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                conn.executemany("DELETE FROM removed_devices WHERE device_key=?", [(k,) for k in keys])
+        except sqlite3.Error:
+            pass
+
+    def clear_device_history(self, ip):
+        """Delete every logged request for this device but keep the device itself."""
+        with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+            n = conn.execute("DELETE FROM access_logs WHERE client_ip=?", (ip,)).rowcount
+        return n
+
+    def remove_device(self, ip):
+        """Delete the device, its history and its quota. Student registrations and
+        attendance records are NOT touched. Returns (found, deleted_log_rows)."""
+        with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+            row = conn.execute("SELECT COALESCE(mac_address,'') FROM devices WHERE ip=?", (ip,)).fetchone()
+            logs = conn.execute("DELETE FROM access_logs WHERE client_ip=?", (ip,)).rowcount
+            dev = conn.execute("DELETE FROM devices WHERE ip=?", (ip,)).rowcount
+            conn.execute("DELETE FROM device_quotas WHERE ip=?", (ip,))
+            key = ((row[0] if row else "") or ip).lower()
+            if dev:
+                conn.execute("INSERT OR REPLACE INTO removed_devices (device_key, removed_at) VALUES (?, ?)",
+                             (key, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                self._removed_keys.add(key)
+        self._mac_cache.pop(ip, None)
+        self._name_state.pop(ip, None)
+        self._refresh_quota_cache()
+        return bool(dev), logs
 
     def get_mac_for_ip(self, ip):
-        """Resolve a hotspot client's current MAC from the Windows neighbor table."""
-        if ip in self._mac_cache and time.time() - self._mac_cache[ip][1] < 10:
-            return self._mac_cache[ip][0]
-        if not ip.startswith("192.168.137."):
+        """Resolve a client's current MAC from local cache or the Windows ARP table."""
+        if not ip:
             return None
+        if ip in ("127.0.0.1", "localhost", "::1"):
+            return "host:local:mac:01"
+        if ip in self._mac_cache and time.time() - self._mac_cache[ip][1] < 15:
+            return self._mac_cache[ip][0]
         try:
             result = subprocess.run(
                 ["arp", "-a", ip], capture_output=True, text=True,
                 timeout=2, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
             match = re.search(r"\b" + re.escape(ip) + r"\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b", result.stdout, re.I)
+            if not match:
+                result2 = subprocess.run(
+                    ["arp", "-a"], capture_output=True, text=True,
+                    timeout=2, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+                match = re.search(r"\b" + re.escape(ip) + r"\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b", result2.stdout, re.I)
+            
             mac = match.group(1).replace("-", ":").lower() if match else None
-            self._mac_cache[ip] = (mac, time.time())
+            if mac:
+                self._mac_cache[ip] = (mac, time.time())
             return mac
         except Exception:
             return None
+
+    def scan_connected_devices(self):
+        """Scan ARP table for connected dynamic devices, update last_seen and auto-mark attendance for recognized student devices."""
+        found = []
+        try:
+            r = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for line in r.stdout.splitlines():
+                m = re.match(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s+dynamic", line)
+                if m:
+                    ip = m.group(1)
+                    mac = m.group(2).replace("-", ":").lower()
+                    if ip.startswith("224.") or ip.startswith("239.") or ip.endswith(".255") or ip == "255.255.255.255":
+                        continue
+                    self._mac_cache[ip] = (mac, time.time())
+                    found.append((ip, mac))
+
+            if found:
+                to_record = []
+                to_name = []
+                with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                    c = conn.cursor()
+                    for ip, mac in found:
+                        c.execute("SELECT mac_address, prn, name, batch, COALESCE(department,''), COALESCE(year,''), COALESCE(division,'') FROM students WHERE mac_address = ?", (mac,))
+                        stu = c.fetchone()
+                        if stu:
+                            # Attendance keeps working even if the admin removed the device card
+                            to_record.append(({"mac_address": stu[0], "prn": stu[1], "name": stu[2], "batch": stu[3],
+                                               "department": stu[4], "year": stu[5], "division": stu[6]}, ip))
+                        if self._is_removed(ip, mac):
+                            continue
+                        if not stu and not ip.startswith("192.168.137."):
+                            continue
+                        c.execute("SELECT ip FROM devices WHERE ip = ?", (ip,))
+                        if c.fetchone():
+                            c.execute("UPDATE devices SET last_seen = ?, mac_address = ? WHERE ip = ?", (now, mac, ip))
+                        else:
+                            if stu:
+                                auto_name, src = f"{stu[2]}'s Device", "student"
+                            else:
+                                auto_name, src = fallback_device_name(ip, mac), "fallback"
+                            c.execute("INSERT INTO devices (ip, custom_name, auto_name, device_type, first_seen, last_seen, mac_address, name_source) VALUES (?, '', ?, 'mobile', ?, ?, ?, ?)",
+                                      (ip, auto_name, now, now, mac, src))
+                        to_name.append(ip)
+
+                for student_dict, client_ip in to_record:
+                    self.record_attendance(student_dict, ip=client_ip)
+                for ip in to_name:
+                    self._schedule_name_refresh(ip)
+        except Exception:
+            pass
+        return found
+
+    def _device_monitor_loop(self):
+        while self.running:
+            try:
+                self.scan_connected_devices()
+            except Exception:
+                pass
+            time.sleep(6)
 
     def get_student_by_mac(self, mac):
         if not mac:
@@ -474,24 +859,101 @@ class NetworkMonitoringEngine:
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 row = conn.execute(
-                    "SELECT mac_address, prn, name, batch FROM students WHERE mac_address=?", (mac,)
+                    "SELECT mac_address, prn, name, batch, COALESCE(department,''), COALESCE(year,''), COALESCE(division,'') "
+                    "FROM students WHERE mac_address=?", (mac,)
                 ).fetchone()
-            return {"mac_address": row[0], "prn": row[1], "name": row[2], "batch": row[3]} if row else None
+            return {"mac_address": row[0], "prn": row[1], "name": row[2], "batch": row[3],
+                    "department": row[4], "year": row[5], "division": row[6]} if row else None
         except sqlite3.Error:
             return None
 
-    def record_attendance(self, student):
+    def record_attendance(self, student, ip=""):
+        """Upsert today's attendance row. Broadcasts a check-in event only the FIRST time
+        a student is seen on a given day, so the dashboard popup is not repeated."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         today = now[:10]
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("""
-                INSERT INTO attendance
-                    (mac_address, prn, student_name, batch, attendance_date, first_seen, last_seen, connection_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(mac_address, attendance_date) DO UPDATE SET
-                    last_seen=excluded.last_seen,
-                    connection_count=attendance.connection_count + 1
-            """, (student["mac_address"], student["prn"], student["name"], student["batch"], today, now, now))
+        dept = student.get("department", "") or ""
+        year = student.get("year", "") or ""
+        div = student.get("division", "") or ""
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                already = conn.execute(
+                    "SELECT 1 FROM attendance WHERE mac_address=? AND attendance_date=?",
+                    (student["mac_address"], today)
+                ).fetchone() is not None
+                conn.execute("""
+                    INSERT INTO attendance
+                        (mac_address, prn, student_name, batch, department, year, division,
+                         attendance_date, first_seen, last_seen, connection_count, ip_address, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'Present')
+                    ON CONFLICT(mac_address, attendance_date) DO UPDATE SET
+                        last_seen=excluded.last_seen,
+                        connection_count=attendance.connection_count + 1,
+                        prn=excluded.prn, student_name=excluded.student_name, batch=excluded.batch,
+                        department=excluded.department, year=excluded.year, division=excluded.division,
+                        ip_address=CASE WHEN excluded.ip_address != '' THEN excluded.ip_address ELSE attendance.ip_address END,
+                        status='Present'
+                """, (student["mac_address"], student["prn"], student["name"], student["batch"],
+                      dept, year, div, today, now, now, ip or ""))
+
+            if not already:
+                self.broadcast_event({
+                    "type": "ATTENDANCE_RECORDED",
+                    "student_name": student["name"],
+                    "prn": student["prn"],
+                    "batch": student["batch"],
+                    "department": dept,
+                    "year": year,
+                    "division": div,
+                    "mac_address": student["mac_address"],
+                    "ip_address": ip,
+                    "time": now
+                })
+        except Exception as e:
+            print(f"Error recording attendance: {e}")
+
+    # ── "Join" prompt: show the registration page only once per device ──
+    def _prompt_key(self, ip, mac):
+        return (mac or ip or "").lower()
+
+    def was_prompted(self, ip, mac):
+        key = self._prompt_key(ip, mac)
+        if not key:
+            return True
+        if key in self._prompted_keys:
+            return True
+        # A device that was prompted by IP before its MAC was resolvable
+        return bool(ip) and ip.lower() in self._prompted_keys
+
+    def mark_prompted(self, ip, mac):
+        key = self._prompt_key(ip, mac)
+        if not key:
+            return
+        self._prompted_keys.add(key)
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO registration_prompts (device_key, prompted_at) VALUES (?, ?)",
+                    (key, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                )
+        except sqlite3.Error:
+            pass
+
+    def reset_prompts(self, device_key=None):
+        """Let a device (or all devices) see the join page one more time."""
+        with self.lock:
+            if device_key:
+                self._prompted_keys.discard(device_key.lower())
+            else:
+                self._prompted_keys.clear()
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                if device_key:
+                    conn.execute("DELETE FROM registration_prompts WHERE device_key=?", (device_key.lower(),))
+                else:
+                    conn.execute("DELETE FROM registration_prompts")
+        except sqlite3.Error:
+            pass
 
     def issue_registration_token(self, ip):
         now = time.time()
@@ -502,7 +964,7 @@ class NetworkMonitoringEngine:
             if token_ip == ip and expires > now:
                 return existing
         token = secrets.token_urlsafe(24)
-        self._registration_tokens[token] = (ip, now + 600)
+        self._registration_tokens[token] = (ip, now + 3600)
         return token
 
     def get_registration_ip(self, token):
@@ -516,30 +978,6 @@ class NetworkMonitoringEngine:
 
     def consume_registration_token(self, token):
         self._registration_tokens.pop(token, None)
-
-    def scan_hotspot_devices(self):
-        """Scans the Windows ARP table for connected devices on the 192.168.137.x hotspot subnet."""
-        try:
-            res = subprocess.run(
-                ["arp", "-a"], capture_output=True, text=True, timeout=3, check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-            clients = re.findall(r'(192\.168\.137\.(?!1\b|255\b)\d+)\s+([0-9a-fA-F-]+)', res.stdout)
-            for ip, raw_mac in clients:
-                mac = raw_mac.replace("-", ":").lower()
-                self._mac_cache[ip] = (mac, time.time())
-                self.get_or_create_device(ip, "")
-                student = self.get_student_by_mac(mac)
-                if student:
-                    self.record_attendance(student)
-        except Exception:
-            pass
-
-    def hotspot_monitor_loop(self):
-        while True:
-            if self.running:
-                self.scan_hotspot_devices()
-            time.sleep(5)
 
     def log_event(self, entry):
         try:
@@ -571,32 +1009,35 @@ class NetworkMonitoringEngine:
         # Broadcast via WebSocket
         self.broadcast_event(entry)
 
-    def register_ws(self, ws):
+    def register_ws(self, ws, loop=None):
         with self.lock:
-            self.ws_subscribers.append(ws)
+            self.ws_subscribers.append((ws, loop))
 
     def unregister_ws(self, ws):
         with self.lock:
-            if ws in self.ws_subscribers:
-                self.ws_subscribers.remove(ws)
+            self.ws_subscribers = [(w, l) for (w, l) in self.ws_subscribers if w != ws]
 
     def broadcast_event(self, event):
         dead = []
         with self.lock:
             subscribers = list(self.ws_subscribers)
         
-        msg = json.dumps({"type": "NEW_LOG", "data": event})
-        for ws in subscribers:
+        if isinstance(event, dict) and 'type' in event:
+            msg = json.dumps(event)
+        else:
+            msg = json.dumps({"type": "NEW_LOG", "data": event})
+        for item in subscribers:
             try:
-                ws.send_text(msg)
+                ws, loop = item if isinstance(item, tuple) else (item, None)
+                if loop and loop.is_running():
+                    import asyncio
+                    asyncio.run_coroutine_threadsafe(ws.send_text(msg), loop)
             except Exception:
                 dead.append(ws)
         
         if dead:
             with self.lock:
-                for d in dead:
-                    if d in self.ws_subscribers:
-                        self.ws_subscribers.remove(d)
+                self.ws_subscribers = [(w, l) for (w, l) in self.ws_subscribers if w not in dead]
 
     def handle_client(self, client_socket, client_address):
         client_ip, _ = client_address
@@ -663,7 +1104,9 @@ class NetworkMonitoringEngine:
             # Plain HTTP can be redirected to the registration page. HTTPS CONNECT
             # cannot be redirected safely without intercepting TLS certificates.
             is_local_portal = host.lower().strip("[]") in {"192.168.137.1", "localhost", "127.0.0.1"}
-            if method != 'CONNECT' and not is_local_portal and not student and not is_background:
+            if (method != 'CONNECT' and not is_local_portal and not student and not is_background
+                    and not self.was_prompted(client_ip, mac_address)):
+                self.mark_prompted(client_ip, mac_address)
                 token = self.issue_registration_token(client_ip)
                 location = f"http://192.168.137.1:5000/attendance/register?token={token}"
                 response = (
@@ -812,43 +1255,26 @@ class NetworkMonitoringEngine:
 
     def start(self):
         self.running = True
-        self.server_sockets = []
-        self.active_ports = []
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(200)
+        print(f"🚀 Gateway Proxy listening on {self.host}:{self.port}")
 
-        candidate_ports = [self.port]
-        if self.port != 8080:
-            candidate_ports.append(8080)
+        # Start background ARP device discovery and auto-attendance monitor
+        t_mon = threading.Thread(target=self._device_monitor_loop, daemon=True)
+        t_mon.start()
 
-        for p in candidate_ports:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((self.host, p))
-                s.listen(200)
-                self.server_sockets.append((s, p))
-                self.active_ports.append(p)
-                print(f"🚀 Gateway Proxy listening on {self.host}:{p}")
-            except Exception as e:
-                if p == 8080:
-                    print(f"ℹ️ Port 8080 is reserved by another service (e.g. Oracle Database XE). Active proxy port: {self.port}")
-                else:
-                    print(f"❌ Failed to bind proxy port {p}: {e}")
-
-        if not self.server_sockets:
-            print("❌ Error: No proxy listening ports could be established.")
-            return
-
-        for s, p in self.server_sockets:
-            t = threading.Thread(target=self._listen_loop, args=(s, p), daemon=True)
-            t.start()
+        # Background workers that look up real device names (hostname) without slowing the proxy
+        if not self._name_workers_started:
+            self._name_workers_started = True
+            for _ in range(2):
+                threading.Thread(target=self._name_worker_loop, daemon=True).start()
+            self._schedule_all_names()
 
         while self.running:
-            time.sleep(1)
-
-    def _listen_loop(self, server_socket, port):
-        while self.running:
             try:
-                client_sock, client_addr = server_socket.accept()
+                client_sock, client_addr = self.server_socket.accept()
                 t = threading.Thread(target=self.handle_client, args=(client_sock, client_addr), daemon=True)
                 t.start()
             except Exception:
@@ -857,11 +1283,10 @@ class NetworkMonitoringEngine:
 
     def stop(self):
         self.running = False
-        for s, _ in self.server_sockets:
+        if self.server_socket:
             try:
-                s.close()
-            except Exception:
+                self.server_socket.close()
+            except:
                 pass
-        self.server_sockets = []
 
 engine = NetworkMonitoringEngine()

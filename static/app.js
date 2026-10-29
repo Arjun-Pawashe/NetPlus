@@ -8,8 +8,6 @@ let currentDeviceFilter = 'All';
 let currentMode = 'clean';
 let activeModalIp = null;
 let activeTab = 'overview';
-let currentProxyHost = '192.168.137.1';
-let currentProxyPort = 8088;
 
 /* ─── Animated Particle Canvas ───────────────── */
 (function initBg() {
@@ -168,16 +166,6 @@ async function fetchStats() {
         document.getElementById('valTotalBlocked').textContent = d.total_blocked.toLocaleString();
         document.getElementById('valActiveDevices').textContent = d.active_devices;
         document.getElementById('subActiveDevices').innerHTML = `<i class="fa-solid fa-circle-dot"></i> ${d.active_devices} Online / ${d.total_devices} Recorded`;
-        if (d.proxy_host) currentProxyHost = d.proxy_host;
-        if (d.proxy_port) currentProxyPort = d.proxy_port;
-        const topbarAddr = document.getElementById('topbarProxyAddr');
-        if (topbarAddr) topbarAddr.innerHTML = `${currentProxyHost}:${currentProxyPort} <i class="fa-regular fa-copy"></i>`;
-        const guidePort = document.getElementById('guideProxyPort');
-        if (guidePort) guidePort.textContent = currentProxyPort;
-        const guideHost = document.getElementById('guideProxyHost');
-        if (guideHost) guideHost.textContent = currentProxyHost;
-        const emptyAddr = document.getElementById('emptyProxyAddr');
-        if (emptyAddr) emptyAddr.textContent = `${currentProxyHost}:${currentProxyPort}`;
         if (d.categories && Object.keys(d.categories).length) {
             categoryChart.data.labels = Object.keys(d.categories);
             categoryChart.data.datasets[0].data = Object.values(d.categories);
@@ -226,50 +214,460 @@ async function fetchAIAnalysis() {
 }
 document.getElementById('btnRefreshAI').addEventListener('click', fetchAIAnalysis);
 
-/* ─── Attendance ─────────────────────────────── */
-async function fetchAttendance() {
-    const date = document.getElementById('attendanceDate').value;
-    const body = document.getElementById('attendanceTableBody');
+/* ─── Main Tabs Navigation ───────────────────── */
+function initNavigationTabs() {
+    document.querySelectorAll('.topbar-nav-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const targetId = btn.getAttribute('data-tab');
+            document.querySelectorAll('.topbar-nav-tab').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.app-tab-pane').forEach(p => p.classList.remove('active'));
+            btn.classList.add('active');
+            const pane = document.getElementById(targetId);
+            if (pane) pane.classList.add('active');
+            
+            if (targetId === 'tabAttendance') {
+                fetchAttendance();
+                fetchAttendanceStats();
+                fetchConnectedDevices();
+            } else if (targetId === 'tabAIExport') {
+                fetchExportSchema();
+                fetchExportPreview();
+            }
+        });
+    });
+}
+
+/* ─── Academic options: Department / Year / Division / year-wise Batches ─── */
+let ACADEMIC = { departments: [], years: [], divisions: [], batches: {} };
+
+function fillSelect(el, items, placeholder, keepValue = true) {
+    if (!el) return;
+    const prev = keepValue ? el.value : '';
+    el.innerHTML = '';
+    const first = document.createElement('option');
+    first.value = placeholder.value;
+    first.textContent = placeholder.label;
+    el.appendChild(first);
+    items.forEach(i => {
+        const o = document.createElement('option');
+        o.value = typeof i === 'string' ? i : i.value;
+        o.textContent = typeof i === 'string' ? i : i.label;
+        el.appendChild(o);
+    });
+    if (prev && Array.from(el.options).some(o => o.value === prev)) el.value = prev;
+}
+
+function batchesForYear(year) {
+    if (year && year !== 'All') return ACADEMIC.batches[year] || [];
+    return [...new Set(Object.values(ACADEMIC.batches).flat())];
+}
+
+function refreshModalBatches() {
+    const year = document.getElementById('regYear')?.value;
+    const sel = document.getElementById('regBatch');
+    if (!sel) return;
+    fillSelect(sel, batchesForYear(year), { value: '', label: year ? 'Select batch' : 'Select year first' });
+    sel.disabled = !year;
+}
+
+function refreshFilterBatches() {
+    const year = document.getElementById('attendanceYearFilter')?.value || 'All';
+    fillSelect(document.getElementById('attendanceBatchFilter'), batchesForYear(year), { value: 'All', label: 'All Batches' });
+}
+
+async function loadAcademicOptions() {
     try {
-        const rows = await fetch(`/api/attendance?date=${encodeURIComponent(date)}`).then(r => r.json());
-        document.getElementById('attendanceCount').textContent = `${rows.length} Present`;
-        body.innerHTML = rows.length ? rows.map(row => `
-            <tr><td class="cell-ip">${escapeHtml(row.prn)}</td><td class="cell-domain">${escapeHtml(row.name)}</td>
-            <td>${escapeHtml(row.batch)}</td><td>${escapeHtml(row.first_seen.split(' ')[1] || row.first_seen)}</td>
-            <td>${escapeHtml(row.last_seen.split(' ')[1] || row.last_seen)}</td><td>${row.connections}</td></tr>`).join('')
-            : '<tr class="table-empty-row"><td colspan="6">No attendance records for this date.</td></tr>';
-    } catch (error) {
-        body.innerHTML = '<tr class="table-empty-row"><td colspan="6">Attendance is temporarily unavailable.</td></tr>';
+        ACADEMIC = await fetch('/api/academic/options').then(r => r.json());
+        fillSelect(document.getElementById('regDepartment'), ACADEMIC.departments, { value: '', label: 'Select department' });
+        fillSelect(document.getElementById('regYear'), ACADEMIC.years, { value: '', label: 'Select year' });
+        fillSelect(document.getElementById('regDivision'), ACADEMIC.divisions, { value: '', label: 'Select div' });
+        fillSelect(document.getElementById('attendanceDeptFilter'), ACADEMIC.departments, { value: 'All', label: 'All Departments' });
+        fillSelect(document.getElementById('attendanceYearFilter'), ACADEMIC.years.map(y => ({ value: y.value, label: y.value })), { value: 'All', label: 'All Years' });
+        fillSelect(document.getElementById('attendanceDivFilter'), ACADEMIC.divisions, { value: 'All', label: 'All Divs' });
+        refreshModalBatches();
+        refreshFilterBatches();
+    } catch (e) {
+        toast('Could not load department / year options', 'fa-circle-exclamation', '#fb7185');
     }
 }
-document.getElementById('btnRefreshAttendance').addEventListener('click', fetchAttendance);
-document.getElementById('attendanceDate').addEventListener('change', fetchAttendance);
-document.getElementById('adminStudentForm').addEventListener('submit', async event => {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const button = form.querySelector('button[type="submit"]');
-    button.disabled = true;
+
+/* ─── Smart Attendance System ────────────────── */
+async function fetchAttendance() {
+    const dateInput = document.getElementById('attendanceDate');
+    const batchSelect = document.getElementById('attendanceBatchFilter');
+    const searchInput = document.getElementById('attendanceSearchInput');
+    const body = document.getElementById('attendanceTableBody');
+    if (!body) return;
+
+    const date = dateInput ? dateInput.value : '';
+    const batch = batchSelect ? batchSelect.value : 'All';
+    const search = searchInput ? searchInput.value.trim() : '';
+    const yearF = (document.getElementById('attendanceYearFilter') || {}).value || 'All';
+    const deptF = (document.getElementById('attendanceDeptFilter') || {}).value || 'All';
+    const divF = (document.getElementById('attendanceDivFilter') || {}).value || 'All';
+
     try {
-        const response = await fetch('/api/students', {
-            method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({
-                mac_address: document.getElementById('adminStudentMac').value,
-                prn: document.getElementById('adminStudentPrn').value,
-                name: document.getElementById('adminStudentName').value,
-                batch: document.getElementById('adminStudentBatch').value
-            })
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.detail || 'Student registration failed.');
-        form.reset();
-        toast(result.message, 'fa-user-check', '#34d399');
-        fetchAttendance();
-    } catch (error) {
-        toast(error.message, 'fa-circle-exclamation', '#fb7185');
-    } finally {
-        button.disabled = false;
+        let url = `/api/attendance?date=${encodeURIComponent(date)}`;
+        if (batch && batch !== 'All') url += `&batch=${encodeURIComponent(batch)}`;
+        if (yearF !== 'All') url += `&year=${encodeURIComponent(yearF)}`;
+        if (deptF !== 'All') url += `&department=${encodeURIComponent(deptF)}`;
+        if (divF !== 'All') url += `&division=${encodeURIComponent(divF)}`;
+        if (search) url += `&search=${encodeURIComponent(search)}`;
+
+        const rows = await fetch(url).then(r => r.json());
+        window._attendanceRows = Object.fromEntries(rows.map(r => [r.id, r]));
+        const countBadge = document.getElementById('attendanceCount');
+        if (countBadge) countBadge.textContent = `${rows.length} Present`;
+
+        if (!rows.length) {
+            body.innerHTML = '<tr class="table-empty-row"><td colspan="13"><i class="fa-solid fa-user-xmark" style="margin-right:8px"></i> No attendance records found for this date.</td></tr>';
+            return;
+        }
+
+        body.innerHTML = rows.map(r => {
+            const statusClass = r.is_online ? 'online' : (r.status === 'Present' ? 'present' : 'late');
+            const statusLabel = r.is_online ? '<span class="pulse-green"></span> Online Now' : (r.status || 'Present');
+            const shortMac = r.mac_address || '—';
+            const shortIp = r.ip_address ? ` (${r.ip_address})` : '';
+
+            return `
+                <tr>
+                    <td class="cell-ip"><strong>${escapeHtml(r.prn)}</strong></td>
+                    <td class="cell-domain"><strong style="color:var(--tx-1)">${escapeHtml(r.name)}</strong></td>
+                    <td style="font-size:12px;color:var(--tx-2)">${escapeHtml(r.department || '—')}</td>
+                    <td><span class="cat-chip cat-academic">${escapeHtml(r.year || '—')}</span></td>
+                    <td><strong>${escapeHtml(r.division || '—')}</strong></td>
+                    <td><span class="cat-chip cat-academic">${escapeHtml(r.batch)}</span></td>
+                    <td style="font-family:var(--f-mono);font-size:11px;color:var(--tx-2)">
+                        ${escapeHtml(shortMac)}<span style="color:var(--tx-3);font-size:10px">${escapeHtml(shortIp)}</span>
+                    </td>
+                    <td>${escapeHtml((r.first_seen||'').split(' ')[1] || r.first_seen)}</td>
+                    <td>${escapeHtml((r.last_seen||'').split(' ')[1] || r.last_seen)}</td>
+                    <td><span style="font-weight:600;color:var(--tx-2)">${escapeHtml(r.duration_formatted)}</span></td>
+                    <td style="font-family:var(--f-mono)">${r.connections || 1}</td>
+                    <td><span class="status-pill ${statusClass}">${statusLabel}</span></td>
+                    <td style="text-align:right;white-space:nowrap">
+                        <button class="icon-btn" onclick="editAttendanceStudent(${r.id})" title="Edit student details" style="width:28px;height:28px;display:inline-flex">
+                            <i class="fa-solid fa-user-pen" style="font-size:11px;color:var(--cyan)"></i>
+                        </button>
+                        <button class="icon-btn" onclick="deleteAttendanceRecord(${r.id})" title="Delete record" style="width:28px;height:28px;display:inline-flex">
+                            <i class="fa-solid fa-trash-can" style="font-size:11px;color:var(--rose)"></i>
+                        </button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+    } catch (e) {
+        body.innerHTML = '<tr class="table-empty-row"><td colspan="13">Unable to load attendance ledger.</td></tr>';
     }
-});
+}
+
+async function fetchAttendanceStats() {
+    const dateInput = document.getElementById('attendanceDate');
+    const date = dateInput ? dateInput.value : '';
+    try {
+        const stats = await fetch(`/api/attendance/stats?date=${encodeURIComponent(date)}`).then(r => r.json());
+        
+        const elReg = document.getElementById('valAttRegistered');
+        const elPres = document.getElementById('valAttPresent');
+        const elActive = document.getElementById('valAttActiveNow');
+        const elRate = document.getElementById('valAttRateBadge');
+        const elNav = document.getElementById('navAttendanceCount');
+
+        if (elReg) elReg.textContent = stats.total_registered || 0;
+        if (elPres) elPres.textContent = stats.present_today || 0;
+        if (elActive) elActive.textContent = stats.active_now || 0;
+        if (elRate) elRate.textContent = `${stats.attendance_rate}% Rate`;
+        if (elNav) elNav.textContent = `${stats.active_now || stats.present_today || 0} Live`;
+
+        // Update batch dropdown options if new batches are available
+        const batchSelect = document.getElementById('attendanceBatchFilter');
+        const yearSel = document.getElementById('attendanceYearFilter');
+        if (batchSelect && stats.batches && (!yearSel || yearSel.value === 'All')) {
+            const currentVal = batchSelect.value;
+            const currentOptions = Array.from(batchSelect.options).map(o => o.value);
+            stats.batches.forEach(b => {
+                if (!currentOptions.includes(b)) {
+                    const opt = document.createElement('option');
+                    opt.value = b;
+                    opt.textContent = b;
+                    batchSelect.appendChild(opt);
+                }
+            });
+            batchSelect.value = currentVal;
+        }
+    } catch(e) {}
+}
+
+async function fetchConnectedDevices() {
+    const radarList = document.getElementById('radarDeviceList');
+    const regSelect = document.getElementById('regDeviceSelect');
+    if (!radarList) return;
+
+    try {
+        const devs = await fetch('/api/connected-devices').then(r => r.json());
+        window._radarStudents = Object.fromEntries(devs.filter(d => d.student && d.mac).map(d => [d.mac, { ...d.student, mac: d.mac }]));
+        if (!devs.length) {
+            radarList.innerHTML = '<div class="loading-cell" style="padding:20px;text-align:center"><i class="fa-solid fa-signal" style="color:var(--tx-3)"></i><p style="margin-top:6px;font-size:12px;color:var(--tx-3)">No active hotspot/Wi-Fi devices detected.</p></div>';
+            return;
+        }
+
+        // Populate modal select
+        if (regSelect) {
+            regSelect.innerHTML = '<option value="">— Pick Live Device —</option>';
+            devs.forEach(d => {
+                if (d.mac) {
+                    const opt = document.createElement('option');
+                    opt.value = d.mac;
+                    opt.textContent = `${d.name} (${d.ip})`;
+                    regSelect.appendChild(opt);
+                }
+            });
+        }
+
+        radarList.innerHTML = devs.map(d => {
+            const isMatched = !!d.student;
+            const statusHtml = isMatched
+                ? `<span class="radar-status-tag matched"><i class="fa-solid fa-check"></i> ${escapeHtml(d.student.name)} (${escapeHtml([d.student.year, d.student.division, d.student.batch].filter(Boolean).join(' · '))})</span>`
+                : `<span class="radar-status-tag unmapped"><i class="fa-solid fa-triangle-exclamation"></i> Unassigned Device</span>`;
+            
+            const actionHtml = isMatched
+                ? `<div style="font-size:10px;color:var(--tx-3);font-family:var(--f-mono)">PRN: ${escapeHtml(d.student.prn)} &bull; Attendance Auto-Updating<button class="radar-edit-link" onclick="editRadarStudent('${escapeHtml(d.mac)}')"><i class="fa-solid fa-user-pen"></i> Edit</button></div>`
+                : `<button class="btn-quick-map" onclick="openAssignModal('${escapeHtml(d.mac)}', '${escapeHtml(d.ip)}')"><i class="fa-solid fa-user-plus"></i> Assign to Student</button>`;
+
+            return `
+                <div class="radar-device-item">
+                    <div class="radar-device-top">
+                        <div class="radar-dev-name">
+                            <i class="fa-solid ${deviceIcon(d.device_type)}" style="color:var(--cyan)"></i>
+                            <span>${escapeHtml(d.name)}</span>
+                        </div>
+                        <span class="live-badge ${d.liveness.toLowerCase()}"><span class="live-dot ${d.liveness==='Online'?'green':'gray'}"></span>${d.liveness}</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <span class="radar-dev-ip">${escapeHtml(d.ip)}</span>
+                        <span class="radar-dev-mac">${escapeHtml(d.mac || 'No MAC')}</span>
+                    </div>
+                    ${statusHtml}
+                    ${actionHtml}
+                </div>
+            `;
+        }).join('');
+    } catch(e) {
+        radarList.innerHTML = '<div class="loading-cell">Failed to scan devices.</div>';
+    }
+}
+
+function openAssignModal(mac, ip) {
+    const modal = document.getElementById('studentModal');
+    if (!modal) return;
+    const inpMac = document.getElementById('regMac');
+    setStudentModalMode(null);
+    if (inpMac && mac) inpMac.value = mac;
+    modal.classList.add('active');
+}
+
+/* ─── Edit student details (attendance section) ─────────── */
+let studentEdit = null;   // {mac, date} while the modal is in edit mode
+const STUDENT_MODAL_DEFAULTS = {};
+
+function setStudentModalMode(st) {
+    const title = document.getElementById('studentModalTitle');
+    const hint = document.getElementById('studentModalHint');
+    const submit = document.getElementById('btnSubmitStudent');
+    if (!title || !hint || !submit) return;
+    if (!STUDENT_MODAL_DEFAULTS.title) {
+        STUDENT_MODAL_DEFAULTS.title = title.innerHTML;
+        STUDENT_MODAL_DEFAULTS.hint = hint.innerHTML;
+        STUDENT_MODAL_DEFAULTS.submit = submit.innerHTML;
+    }
+    studentEdit = st ? { mac: st.mac, date: st.date || null } : null;
+    title.innerHTML = st ? 'Edit Student Details' : STUDENT_MODAL_DEFAULTS.title;
+    hint.innerHTML = st ? 'Update this student\'s PRN, name, department, year, division or batch. The linked device (MAC address) stays the same.' : STUDENT_MODAL_DEFAULTS.hint;
+    submit.innerHTML = st ? '<i class="fa-solid fa-floppy-disk"></i> Save Changes' : STUDENT_MODAL_DEFAULTS.submit;
+    document.getElementById('regMac').readOnly = !!st;
+    document.getElementById('regDeviceSelect').style.display = st ? 'none' : '';
+    document.getElementById('regHistoryWrap').style.display = st ? 'flex' : 'none';
+    if (!st) document.getElementById('studentRegistrationForm').reset();
+}
+
+function closeStudentModal() {
+    document.getElementById('studentModal').classList.remove('active');
+    setStudentModalMode(null);
+    refreshModalBatches();
+}
+
+function ensureOption(sel, value) {
+    if (value && !Array.from(sel.options).some(o => o.value === value)) {
+        const o = document.createElement('option');
+        o.value = value; o.textContent = value;
+        sel.appendChild(o);
+    }
+}
+
+window.openStudentEditor = function(st) {
+    const modal = document.getElementById('studentModal');
+    if (!modal || !st.mac) { toast('This record has no linked device to edit.', 'fa-circle-exclamation', '#f59e0b'); return; }
+    setStudentModalMode(null);                       // clean slate
+    setStudentModalMode(st);
+    document.getElementById('regPrn').value = st.prn || '';
+    document.getElementById('regName').value = st.name || '';
+    const dept = document.getElementById('regDepartment'), yr = document.getElementById('regYear'),
+          div = document.getElementById('regDivision'), bat = document.getElementById('regBatch');
+    ensureOption(dept, st.department); dept.value = st.department || '';
+    ensureOption(yr, st.year);         yr.value = st.year || '';
+    ensureOption(div, st.division);    div.value = st.division || '';
+    refreshModalBatches();
+    ensureOption(bat, st.batch);       bat.value = st.batch || '';
+    document.getElementById('regMac').value = st.mac;
+    document.getElementById('regApplyHistory').checked = true;
+    modal.classList.add('active');
+};
+
+window.editAttendanceStudent = function(id) {
+    const r = (window._attendanceRows || {})[id];
+    if (!r) return;
+    openStudentEditor({ mac: r.mac_address, prn: r.prn, name: r.name, department: r.department,
+                        year: r.year, division: r.division, batch: r.batch, date: r.date });
+};
+
+window.editRadarStudent = function(mac) {
+    const st = (window._radarStudents || {})[mac];
+    if (st) openStudentEditor(st);
+};
+
+async function deleteAttendanceRecord(id) {
+    if (!confirm('Remove this attendance record?')) return;
+    try {
+        await fetch(`/api/attendance/${id}`, { method: 'DELETE' });
+        toast('Attendance record deleted', 'fa-trash-can', '#f59e0b');
+        fetchAttendance();
+        fetchAttendanceStats();
+    } catch(e) {
+        toast('Failed to delete record', 'fa-circle-exclamation', '#fb7185');
+    }
+}
+
+/* ─── AI Dataset Export Studio ───────────────── */
+let activeDatasetType = 'traffic_features';
+
+function initAIExportStudio() {
+    // Dataset Card selection
+    document.querySelectorAll('.dataset-card').forEach(card => {
+        card.addEventListener('click', () => {
+            document.querySelectorAll('.dataset-card').forEach(c => c.classList.remove('selected'));
+            card.classList.add('selected');
+            const radio = card.querySelector('input[type="radio"]');
+            if (radio) radio.checked = true;
+            activeDatasetType = card.getAttribute('data-dataset-type') || 'traffic_features';
+            fetchExportSchema();
+            fetchExportPreview();
+        });
+    });
+
+    // Formats & Limit change
+    const selFmt = document.getElementById('exportFormatSelect');
+    const selMode = document.getElementById('exportModeSelect');
+    const selLimit = document.getElementById('exportLimitSelect');
+    if (selFmt) selFmt.addEventListener('change', fetchExportPreview);
+    if (selMode) selMode.addEventListener('change', fetchExportPreview);
+    if (selLimit) selLimit.addEventListener('change', fetchExportPreview);
+
+    // Refresh preview button
+    const btnRefPrev = document.getElementById('btnRefreshPreview');
+    if (btnRefPrev) btnRefPrev.addEventListener('click', fetchExportPreview);
+
+    // Download AI Dataset button
+    const btnDownload = document.getElementById('btnDownloadAIDataset');
+    if (btnDownload) {
+        btnDownload.addEventListener('click', () => {
+            const format = selFmt ? selFmt.value : 'csv';
+            const mode = selMode ? selMode.value : 'clean';
+            const limit = selLimit ? selLimit.value : '5000';
+            const downloadUrl = `/api/export/ai-dataset?type=${activeDatasetType}&format=${format}&mode=${mode}&limit=${limit}`;
+            
+            toast(`Generating ${activeDatasetType} dataset…`, 'fa-cloud-arrow-down', '#6366f1');
+            const link = document.createElement('a');
+            link.href = downloadUrl;
+            link.setAttribute('download', '');
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            setTimeout(() => toast('AI Dataset downloaded successfully!', 'fa-circle-check', '#10b981'), 1200);
+        });
+    }
+
+    // Copy API URL button
+    const btnCopy = document.getElementById('btnCopyDatasetAPI');
+    if (btnCopy) {
+        btnCopy.addEventListener('click', () => {
+            const format = selFmt ? selFmt.value : 'csv';
+            const mode = selMode ? selMode.value : 'clean';
+            const limit = selLimit ? selLimit.value : '5000';
+            const fullUrl = `${location.protocol}//${location.host}/api/export/ai-dataset?type=${activeDatasetType}&format=${format}&mode=${mode}&limit=${limit}`;
+            navigator.clipboard.writeText(fullUrl).then(() => {
+                toast('API URL copied to clipboard!', 'fa-copy', '#34d399');
+            }).catch(() => {
+                prompt('Copy dataset API URL:', fullUrl);
+            });
+        });
+    }
+}
+
+async function fetchExportSchema() {
+    const tbody = document.getElementById('schemaTableBody');
+    const descEl = document.getElementById('schemaDatasetDesc');
+    if (!tbody) return;
+    try {
+        const data = await fetch('/api/export/schema').then(r => r.json());
+        const dsInfo = data.datasets && data.datasets[activeDatasetType];
+        if (!dsInfo) return;
+        if (descEl) descEl.textContent = dsInfo.description;
+
+        tbody.innerHTML = dsInfo.attributes.map(attr => `
+            <tr>
+                <td style="font-family:var(--f-mono);font-weight:700;color:var(--tx-1)">${escapeHtml(attr.name)}</td>
+                <td style="font-family:var(--f-mono);font-size:11px;color:var(--tx-code)">${escapeHtml(attr.type)}</td>
+                <td><span class="role-badge ${escapeHtml(attr.role)}">${escapeHtml(attr.role)}</span></td>
+                <td style="color:var(--tx-2);font-size:12px">${escapeHtml(attr.description)}</td>
+            </tr>
+        `).join('');
+    } catch(e) {
+        tbody.innerHTML = '<tr><td colspan="4" class="loading-cell">Failed to load feature schema.</td></tr>';
+    }
+}
+
+async function fetchExportPreview() {
+    const container = document.getElementById('previewTableContainer');
+    if (!container) return;
+    const mode = document.getElementById('exportModeSelect')?.value || 'clean';
+
+    container.innerHTML = '<div class="loading-cell"><i class="fa-solid fa-spinner fa-spin"></i> Generating preview sample…</div>';
+
+    try {
+        const rows = await fetch(`/api/export/ai-dataset?type=${activeDatasetType}&format=json&limit=5&mode=${mode}`).then(r => r.json());
+        if (!rows || !rows.length) {
+            container.innerHTML = '<div class="loading-cell">No data rows recorded yet.</div>';
+            return;
+        }
+
+        const headers = Object.keys(rows[0]);
+        const theadHtml = headers.map(h => `<th>${escapeHtml(h)}</th>`).join('');
+        const tbodyHtml = rows.map(row => {
+            const cells = headers.map(h => `<td style="font-family:var(--f-mono);font-size:11px">${escapeHtml(row[h])}</td>`).join('');
+            return `<tr>${cells}</tr>`;
+        }).join('');
+
+        container.innerHTML = `
+            <table class="log-table mini" style="white-space:nowrap">
+                <thead><tr>${theadHtml}</tr></thead>
+                <tbody>${tbodyHtml}</tbody>
+            </table>
+        `;
+    } catch(e) {
+        container.innerHTML = '<div class="loading-cell">Failed to load preview sample.</div>';
+    }
+}
 
 /* ─── Latency Monitor ───────────────────────── */
 const LATENCY_COLORS = ['#6366f1','#06b6d4','#10b981','#f59e0b','#f43f5e','#a855f7'];
@@ -375,7 +773,7 @@ async function fetchDevices() {
         devices.forEach(d => {
             const icon = d.device_type==='mobile'?'📱':d.device_type==='tablet'?'📟':'💻';
             const dot  = d.liveness==='Online'?'🟢':d.liveness==='Idle'?'🟡':'⚪';
-            pillsHtml += `<button class="d-pill ${currentDeviceFilter===d.ip?'active':''}" data-ip="${d.ip}">${dot}${icon} ${d.name}</button>`;
+            pillsHtml += `<button class="d-pill ${currentDeviceFilter===d.ip?'active':''}" data-ip="${escapeHtml(d.ip)}">${dot}${icon} ${escapeHtml(d.name)}</button>`;
         });
         pillsEl.innerHTML = pillsHtml;
         pillsEl.querySelectorAll('.d-pill').forEach(btn => btn.addEventListener('click', () => {
@@ -390,12 +788,12 @@ async function fetchDevices() {
         if (sel) {
             const prev = sel.value;
             sel.innerHTML = '<option value="">— Select Device —</option>' +
-                devices.map(d => `<option value="${d.ip}">${d.name} (${d.ip})</option>`).join('');
+                devices.map(d => `<option value="${escapeHtml(d.ip)}">${escapeHtml(d.name)} (${escapeHtml(d.ip)})</option>`).join('');
             if (prev) sel.value = prev;
         }
 
         if (!devices.length) {
-            container.innerHTML = `<div class="empty-state"><div class="empty-icon"><i class="fa-solid fa-plug-circle-xmark"></i></div><h3>No Devices Connected</h3><p>Connect your phone to the PC Hotspot and configure proxy <code>${currentProxyHost}:${currentProxyPort}</code></p><button class="btn-setup-link" onclick="document.getElementById('guideModal').classList.add('active')"><i class="fa-solid fa-bolt"></i> Quick Setup Guide</button></div>`;
+            container.innerHTML = `<div class="empty-state"><div class="empty-icon"><i class="fa-solid fa-plug-circle-xmark"></i></div><h3>No Devices Connected</h3><p>Connect your phone to the PC Hotspot and configure proxy <code>192.168.137.1:8080</code></p><button class="btn-setup-link" onclick="document.getElementById('guideModal').classList.add('active')"><i class="fa-solid fa-bolt"></i> Quick Setup Guide</button></div>`;
             return;
         }
 
@@ -418,11 +816,13 @@ async function fetchDevices() {
                 <div class="tile-top">
                     <div class="tile-avatar-group">
                         <div class="tile-icon"><i class="fa-solid ${ico}"></i></div>
-                        <div><div class="tile-name">${d.name}</div><div class="tile-ip">${d.ip}</div></div>
+                        <div><div class="tile-name">${escapeHtml(d.name)}</div><div class="tile-ip">${escapeHtml(d.ip)}</div></div>
                     </div>
                     <div style="display:flex;align-items:center;gap:6px">
                         ${badge}
-                        <button class="rename-mini-btn" onclick="event.stopPropagation();openRenameModal('${d.ip}','${d.name}')" title="Rename"><i class="fa-solid fa-pen"></i></button>
+                        <button class="rename-mini-btn" data-act="rename" data-ip="${escapeHtml(d.ip)}" data-name="${escapeHtml(d.name)}" onclick="event.stopPropagation();deviceAction(this)" title="Rename"><i class="fa-solid fa-pen"></i></button>
+                        <button class="rename-mini-btn" data-act="clear" data-ip="${escapeHtml(d.ip)}" data-name="${escapeHtml(d.name)}" onclick="event.stopPropagation();deviceAction(this)" title="Clear this device's history"><i class="fa-solid fa-eraser"></i></button>
+                        <button class="rename-mini-btn danger" data-act="remove" data-ip="${escapeHtml(d.ip)}" data-name="${escapeHtml(d.name)}" onclick="event.stopPropagation();deviceAction(this)" title="Remove device"><i class="fa-solid fa-trash-can"></i></button>
                     </div>
                 </div>
                 <div class="tile-stats">
@@ -564,6 +964,53 @@ function switchModalTab(tab) {
 }
 document.querySelectorAll('.modal-tab').forEach(btn => btn.addEventListener('click', ()=>switchModalTab(btn.dataset.tab)));
 
+/* ─── Remove device / clear history ─────────── */
+window.deviceAction = function(btn) {
+    const { act, ip, name } = btn.dataset;
+    if (act === 'rename') openRenameModal(ip, name);
+    else if (act === 'clear') clearDeviceHistory(ip, name);
+    else if (act === 'remove') removeDevice(ip, name);
+};
+
+function afterDeviceChange(ip, removed) {
+    const modalOpen = document.getElementById('deviceModal').classList.contains('active') && activeModalIp === ip;
+    if (removed) {
+        if (currentDeviceFilter === ip) currentDeviceFilter = 'All';
+        if (modalOpen) document.getElementById('deviceModal').classList.remove('active');
+    }
+    fetchDevices(); fetchLogs(); fetchStats();
+    if (!removed && modalOpen) openDeviceModal(ip);
+}
+
+window.clearDeviceHistory = async function(ip, name) {
+    if (!confirm(`Delete all browsing history for "${name || ip}"?\n\nThe device stays on the dashboard. This cannot be undone.`)) return;
+    try {
+        const r = await fetch(`/api/devices/${encodeURIComponent(ip)}/history`, { method: 'DELETE' });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || 'Could not clear history');
+        toast(d.message, 'fa-eraser', '#f59e0b');
+        afterDeviceChange(ip, false);
+    } catch (e) { toast(e.message || 'Could not clear history', 'fa-circle-exclamation', '#fb7185'); }
+};
+
+window.removeDevice = async function(ip, name) {
+    if (!confirm(`Remove "${name || ip}" from the dashboard?\n\nThis deletes the device, its browsing history and its quota. Student registration and attendance records are kept.\n\nIf the device browses through the proxy again it will be re-added as a new device.`)) return;
+    try {
+        const r = await fetch(`/api/devices/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || 'Could not remove device');
+        toast(d.message, 'fa-trash-can', '#f59e0b');
+        afterDeviceChange(ip, true);
+    } catch (e) { toast(e.message || 'Could not remove device', 'fa-circle-exclamation', '#fb7185'); }
+};
+
+document.getElementById('btnModalClearHistory').addEventListener('click', () => {
+    if (activeModalIp) clearDeviceHistory(activeModalIp, document.getElementById('modalDevName').textContent);
+});
+document.getElementById('btnModalRemoveDevice').addEventListener('click', () => {
+    if (activeModalIp) removeDevice(activeModalIp, document.getElementById('modalDevName').textContent);
+});
+
 /* ─── Rename Modal ───────────────────────────── */
 window.openRenameModal = function(ip, name) { activeModalIp=ip; document.getElementById('renameInput').value=name||''; document.getElementById('renameModal').classList.add('active'); };
 document.getElementById('btnSaveRename').addEventListener('click', async () => {
@@ -682,19 +1129,15 @@ document.getElementById('btnDownloadReport').addEventListener('click', async ()=
     } catch(e) { toast('Report generation failed','fa-circle-exclamation','#fb7185'); }
 });
 
-/* ─── CSV Export ─────────────────────────────── */
-document.getElementById('btnExportCSV').addEventListener('click', async ()=>{
-    try {
-        const logs = await fetch(`/api/logs?limit=10000&mode=${currentMode}`).then(r=>r.json());
-        if (!logs||!logs.length) { toast('No logs to export','fa-circle-info','#f59e0b'); return; }
-        const headers = ['Time','Device','IP','Website','Category','Bytes','Status'];
-        const rows = logs.map(l=>[l.timestamp,l.device_name,l.client_ip,l.clean_site||l.domain,l.category,l.bytes,l.status].map(v=>`"${v}"`).join(','));
-        const a = document.createElement('a');
-        a.href = 'data:text/csv;charset=utf-8,'+encodeURIComponent([headers.join(','),...rows].join('\n'));
-        a.download = `netpulse_logs_${new Date().toISOString().slice(0,10)}.csv`;
-        a.click();
-        toast('CSV exported!','fa-download','#34d399');
-    } catch(e) { toast('Export failed','fa-circle-exclamation','#fb7185'); }
+/* ─── CSV / AI Dataset Export ─────────────────────────── */
+document.getElementById('btnExportCSV').addEventListener('click', ()=>{
+    const aiTabBtn = document.querySelector('.tab-nav-btn[data-tab="tabAIExport"]');
+    if (aiTabBtn) {
+        aiTabBtn.click();
+        const exportCard = document.querySelector('.ai-export-card');
+        if (exportCard) exportCard.scrollIntoView({ behavior: 'smooth' });
+        toast('Opened AI Analytics & Dataset Export Studio', 'fa-brain', '#6366f1');
+    }
 });
 
 /* ─── Clear Logs ─────────────────────────────── */
@@ -733,7 +1176,7 @@ document.getElementById('btnClearDates').addEventListener('click', ()=>{
 
 /* ─── Gateway Copy ───────────────────────────── */
 document.getElementById('gatewayBox').addEventListener('click', ()=>{
-    navigator.clipboard.writeText(`${currentProxyHost}:${currentProxyPort}`).catch(()=>{});
+    navigator.clipboard.writeText('192.168.137.1:8080').catch(()=>{});
     toast('Proxy address copied!','fa-copy','#06b6d4');
 });
 
@@ -766,6 +1209,18 @@ function connectWS() {
     ws.onmessage = e=>{
         try {
             const msg=JSON.parse(e.data);
+            if (msg.type === 'ATTENDANCE_RECORDED') {
+                fetchAttendance();
+                fetchAttendanceStats();
+                fetchConnectedDevices();
+                toast(`🎓 Auto-Attendance: ${msg.student_name || 'Student'} checked in (${msg.time?.split(' ')[1] || 'now'})!`, 'fa-user-check', '#10b981');
+                return;
+            }
+            if (msg.type === 'DEVICE_CONNECTED') {
+                fetchConnectedDevices();
+                fetchAttendanceStats();
+                return;
+            }
             if (msg.type!=='NEW_LOG') return;
             const log=msg.data;
             if (currentMode==='clean' && log.is_background) return;
@@ -796,27 +1251,172 @@ function connectWS() {
     };
 }
 
+/* ─── Student Registration Modal & Attendance Hooks ────────── */
+function initStudentModal() {
+    const btnOpen = document.getElementById('btnOpenStudentModal');
+    const modal = document.getElementById('studentModal');
+    const btnClose = document.getElementById('btnCloseStudentModal');
+    const btnCancel = document.getElementById('btnCancelStudentModal');
+    const form = document.getElementById('studentRegistrationForm');
+    const selDevice = document.getElementById('regDeviceSelect');
+    const inpMac = document.getElementById('regMac');
+
+    if (btnOpen && modal) btnOpen.addEventListener('click', () => { setStudentModalMode(null); fetchConnectedDevices(); modal.classList.add('active'); });
+    if (btnClose && modal) btnClose.addEventListener('click', closeStudentModal);
+    if (btnCancel && modal) btnCancel.addEventListener('click', closeStudentModal);
+
+    if (selDevice && inpMac) {
+        selDevice.addEventListener('change', () => {
+            if (selDevice.value) inpMac.value = selDevice.value;
+        });
+    }
+
+    if (form) {
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btnSubmit = form.querySelector('button[type="submit"]');
+            btnSubmit.disabled = true;
+            try {
+                const fields = {
+                    prn: document.getElementById('regPrn').value.trim(),
+                    name: document.getElementById('regName').value.trim(),
+                    department: document.getElementById('regDepartment').value,
+                    year: document.getElementById('regYear').value,
+                    division: document.getElementById('regDivision').value,
+                    batch: document.getElementById('regBatch').value
+                };
+                const res = studentEdit
+                    ? await fetch(`/api/students/${encodeURIComponent(studentEdit.mac)}`, {
+                        method: 'PUT',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ ...fields,
+                            apply_to_history: document.getElementById('regApplyHistory').checked,
+                            date: studentEdit.date })
+                    })
+                    : await fetch('/api/students', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ ...fields, mac_address: inpMac.value.trim() })
+                    });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Failed to register student');
+                
+                toast(data.message || (studentEdit ? 'Student details updated.' : 'Student registered & attendance updated!'), 'fa-user-check', '#10b981');
+                form.reset();
+                closeStudentModal();
+                fetchAttendance();
+                fetchAttendanceStats();
+                fetchConnectedDevices();
+            } catch(err) {
+                toast(err.message, 'fa-circle-exclamation', '#fb7185');
+            } finally {
+                btnSubmit.disabled = false;
+            }
+        });
+    }
+
+    // Year-wise batch dropdown + "add batch"
+    const regYear = document.getElementById('regYear');
+    if (regYear) regYear.addEventListener('change', refreshModalBatches);
+    const btnAddBatch = document.getElementById('btnAddYearBatch');
+    if (btnAddBatch) btnAddBatch.addEventListener('click', async () => {
+        const year = regYear ? regYear.value : '';
+        if (!year) { toast('Select a year first', 'fa-circle-exclamation', '#f59e0b'); return; }
+        const name = (prompt(`New batch name for ${year} (e.g. ${year}-B5):`) || '').trim();
+        if (!name) return;
+        try {
+            const res = await fetch('/api/academic/batches', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ year, batch: name })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Could not add batch');
+            toast(data.message, 'fa-layer-group', '#10b981');
+            await loadAcademicOptions();
+            regYear.value = year;
+            refreshModalBatches();
+            document.getElementById('regBatch').value = name;
+        } catch (err) {
+            toast(err.message, 'fa-circle-exclamation', '#fb7185');
+        }
+    });
+
+    // Attendance Filter Controls
+    ['attendanceDeptFilter', 'attendanceDivFilter'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', fetchAttendance);
+    });
+    const yearFilter = document.getElementById('attendanceYearFilter');
+    if (yearFilter) yearFilter.addEventListener('change', () => { refreshFilterBatches(); fetchAttendance(); });
+    const dateInp = document.getElementById('attendanceDate');
+    const batchSel = document.getElementById('attendanceBatchFilter');
+    const searchInp = document.getElementById('attendanceSearchInput');
+    const btnToday = document.getElementById('btnTodayAttendance');
+    const btnRefAtt = document.getElementById('btnRefreshAttendance');
+    const btnRefRadar = document.getElementById('btnRefreshRadar');
+    const btnExpAtt = document.getElementById('btnExportAttendanceCSV');
+
+    if (dateInp) dateInp.addEventListener('change', () => { fetchAttendance(); fetchAttendanceStats(); });
+    if (batchSel) batchSel.addEventListener('change', fetchAttendance);
+    if (searchInp) searchInp.addEventListener('input', () => {
+        clearTimeout(window._attSearchTimer);
+        window._attSearchTimer = setTimeout(fetchAttendance, 250);
+    });
+    if (btnToday && dateInp) {
+        btnToday.addEventListener('click', () => {
+            const today = new Date();
+            dateInp.value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+            fetchAttendance();
+            fetchAttendanceStats();
+        });
+    }
+    if (btnRefAtt) btnRefAtt.addEventListener('click', () => { fetchAttendance(); fetchAttendanceStats(); });
+    if (btnRefRadar) btnRefRadar.addEventListener('click', fetchConnectedDevices);
+    if (btnExpAtt) {
+        btnExpAtt.addEventListener('click', () => {
+            const dateVal = dateInp ? dateInp.value : '';
+            toast('Downloading Attendance CSV…', 'fa-file-csv', '#10b981');
+            const link = document.createElement('a');
+            link.href = `/api/export/ai-dataset?type=attendance_ml&format=csv`;
+            link.setAttribute('download', '');
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        });
+    }
+}
+
 /* ─── Bootstrap ───────────────────────────────── */
 document.addEventListener('DOMContentLoaded', ()=>{
     initCharts();
+    initNavigationTabs();
+    initStudentModal();
+    initAIExportStudio();
     requestNotificationPerm();
     fetchStats();
     fetchDevices();
     fetchLogs();
     fetchBandwidthTrend();
     fetchAIAnalysis();
+
     const attendanceDate = document.getElementById('attendanceDate');
     const today = new Date();
-    attendanceDate.value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+    if (attendanceDate) {
+        attendanceDate.value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+    }
+    loadAcademicOptions();
     fetchAttendance();
+    fetchAttendanceStats();
+    fetchConnectedDevices();
     fetchLatency();
     connectWS();
-    // Auto-refresh every 4s
+
+    // Auto-refresh loops
     setInterval(()=>{ fetchStats(); fetchDevices(); }, 4000);
-    setInterval(fetchAIAnalysis, 30000);
+    setInterval(fetchConnectedDevices, 7000);
+    setInterval(fetchAttendanceStats, 10000);
     setInterval(fetchAttendance, 30000);
-    // Bandwidth trend every 60s
+    setInterval(fetchAIAnalysis, 30000);
     setInterval(fetchBandwidthTrend, 60000);
-    // Latency every 35s (slightly offset from backend 30s)
     setInterval(fetchLatency, 35000);
 });
