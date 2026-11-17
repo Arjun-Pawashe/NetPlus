@@ -17,7 +17,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from engine import engine, DB_PATH, DEPARTMENTS, YEARS, DIVISIONS
+from engine import (
+    engine, DB_PATH, DEPARTMENTS, YEARS, DIVISIONS, GATEWAY_IP,
+    HOTSPOT_NETWORK, is_hotspot_client
+)
 
 app = FastAPI(title="NetPulse — Cyber NOC 2.0", version="4.0.0")
 
@@ -130,11 +133,21 @@ class StudentUpdateRequest(BaseModel):
     batch: str
     apply_to_history: bool = True      # also correct past attendance rows of this student
     date: Optional[str] = None         # used when apply_to_history is False (defaults to today)
+    session_id: Optional[int] = None   # when set (and apply_to_history is False) only that session's row is corrected
 
 class ManualCheckInRequest(BaseModel):
     prn: str
     status: Optional[str] = "Present"
-    date: Optional[str] = None
+    session_id: Optional[int] = None   # defaults to the active session
+
+class SessionCreateRequest(BaseModel):
+    session_type: str                  # "Lab" or "Theory"
+    title: Optional[str] = ""
+    date: Optional[str] = None         # YYYY-MM-DD (defaults to today)
+    time: Optional[str] = None         # HH:MM (defaults to now)
+    year: str = ""                     # "" = all
+    division: str = ""                 # "" = all
+    batch: str = ""                    # "" = all
 
 class DirectStudentRegistrationRequest(BaseModel):
     mac_address: str
@@ -198,6 +211,16 @@ def get_index():
     idx = os.path.join(STATIC_DIR, "index.html")
     return FileResponse(idx) if os.path.exists(idx) else HTMLResponse("<h1>Starting…</h1>")
 
+
+@app.get("/api/config")
+def get_runtime_config():
+    return {
+        "gateway_ip": GATEWAY_IP,
+        "proxy_port": engine.port,
+        "client_network": str(HOTSPOT_NETWORK),
+    }
+
+
 # ─── Stats ────────────────────────────────────────────────────
 @app.get("/api/stats")
 def get_stats(mode: str = "clean", date_from: Optional[str] = None, date_to: Optional[str] = None):
@@ -230,9 +253,6 @@ def get_stats(mode: str = "clean", date_from: Optional[str] = None, date_to: Opt
     c.execute("""
         SELECT d.ip, d.last_seen 
         FROM devices d
-        WHERE d.ip LIKE '192.168.137.%' 
-           OR EXISTS (SELECT 1 FROM access_logs a WHERE a.client_ip = d.ip)
-           OR EXISTS (SELECT 1 FROM students s WHERE s.mac_address = d.mac_address)
     """)
     rows = c.fetchall()
     online = sum(1 for r in rows if calculate_device_liveness(r[1])[0] == "Online")
@@ -422,30 +442,47 @@ def register_attendance_student(req: StudentRegistrationRequest):
     engine.consume_registration_token(req.token)
     student = {"mac_address": mac, "prn": prn, "name": name, "batch": batch,
                "department": department, "year": year, "division": division}
-    engine.record_attendance(student, ip=ip)
+    marked = engine.record_attendance(student, ip=ip)
     return {"status": "ok", "name": name, "prn": prn, "batch": batch,
             "department": department, "year": year, "division": division,
+            "attendance_marked": marked,
             "attendance_date": datetime.now().strftime("%Y-%m-%d")}
+
+def _session_scope_sql(session_id: Optional[str], date: Optional[str], alias: str = "a"):
+    """Build the WHERE fragment that scopes attendance rows to a session / the legacy rows / a date."""
+    col = f"{alias}." if alias else ""
+    if session_id and session_id not in ("all", "legacy"):
+        try:
+            return f" {col}session_id = ?", [int(session_id)]
+        except ValueError:
+            raise HTTPException(400, "Invalid session id.")
+    if session_id == "legacy":
+        return f" {col}session_id IS NULL AND {col}attendance_date = ?", [date]
+    return f" {col}attendance_date = ?", [date]
 
 @app.get("/api/attendance")
 def get_attendance(date: Optional[str] = None, batch: Optional[str] = None, search: Optional[str] = None,
-                   year: Optional[str] = None, department: Optional[str] = None, division: Optional[str] = None):
+                   year: Optional[str] = None, department: Optional[str] = None, division: Optional[str] = None,
+                   session_id: Optional[str] = None):
+    """session_id: a session id, "all" (every session on `date`, default) or "legacy" (pre-session daily records)."""
     attendance_date = date or datetime.now().strftime("%Y-%m-%d")
     try:
         datetime.strptime(attendance_date, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(400, "Date must use YYYY-MM-DD format.")
-    
+
     with sqlite3.connect(DB_PATH) as conn:
         query = """
-            SELECT a.id, a.prn, a.student_name, a.batch, a.mac_address, 
-                   COALESCE(a.ip_address, ''), a.attendance_date, a.first_seen, a.last_seen, 
+            SELECT a.id, a.prn, a.student_name, a.batch, a.mac_address,
+                   COALESCE(a.ip_address, ''), a.attendance_date, a.first_seen, a.last_seen,
                    a.connection_count, COALESCE(a.status, 'Present'),
-                   COALESCE(a.department, ''), COALESCE(a.year, ''), COALESCE(a.division, '')
+                   COALESCE(a.department, ''), COALESCE(a.year, ''), COALESCE(a.division, ''),
+                   a.session_id, COALESCE(s.session_type, ''), COALESCE(s.title, '')
             FROM attendance a
-            WHERE a.attendance_date = ?
-        """
-        params = [attendance_date]
+            LEFT JOIN sessions s ON s.id = a.session_id
+            WHERE"""
+        scope_sql, params = _session_scope_sql(session_id, attendance_date)
+        query += scope_sql
         if batch and batch != "All":
             query += " AND a.batch = ?"
             params.append(batch)
@@ -460,16 +497,16 @@ def get_attendance(date: Optional[str] = None, batch: Optional[str] = None, sear
             params.append(division)
         if search:
             query += " AND (a.prn LIKE ? OR a.student_name LIKE ? OR a.mac_address LIKE ?)"
-            s = f"%{search.strip()}%"
-            params.extend([s, s, s])
-        
+            s_ = f"%{search.strip()}%"
+            params.extend([s_, s_, s_])
+
         query += " ORDER BY a.first_seen DESC"
         rows = conn.execute(query, params).fetchall()
 
     results = []
     now = datetime.now()
     for r in rows:
-        aid, prn, name, bat, mac, ip, adate, first_s, last_s, count, status, dept, yr, div = r
+        aid, prn, name, bat, mac, ip, adate, first_s, last_s, count, status, dept, yr, div, sid, stype, stitle = r
         dur_mins = 0
         is_online = False
         try:
@@ -480,7 +517,7 @@ def get_attendance(date: Optional[str] = None, batch: Optional[str] = None, sear
             is_online = diff_now <= 90
         except Exception:
             pass
-        
+
         dur_str = f"{dur_mins // 60}h {dur_mins % 60}m" if dur_mins >= 60 else f"{dur_mins}m"
         results.append({
             "id": aid,
@@ -493,6 +530,9 @@ def get_attendance(date: Optional[str] = None, batch: Optional[str] = None, sear
             "mac_address": mac,
             "ip_address": ip,
             "date": adate,
+            "session_id": sid,
+            "session_type": stype,
+            "session_title": stitle,
             "first_seen": first_s,
             "last_seen": last_s,
             "duration_minutes": dur_mins,
@@ -504,17 +544,30 @@ def get_attendance(date: Optional[str] = None, batch: Optional[str] = None, sear
     return results
 
 @app.get("/api/attendance/stats")
-def get_attendance_stats(date: Optional[str] = None):
+def get_attendance_stats(date: Optional[str] = None, session_id: Optional[str] = None):
     attendance_date = date or datetime.now().strftime("%Y-%m-%d")
+    eligible_label = "registered"
     with sqlite3.connect(DB_PATH) as conn:
         total_students = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0] or 0
-        present_count = conn.execute("SELECT COUNT(*) FROM attendance WHERE attendance_date=?", (attendance_date,)).fetchone()[0] or 0
+        if session_id and session_id not in ("all", "legacy"):
+            sess = conn.execute("SELECT year, division, batch FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if sess:
+                # Only students of the session's Year / Div / Batch count as "eligible"
+                q, p = "SELECT COUNT(*) FROM students WHERE 1=1", []
+                for col, val in zip(("year", "division", "batch"), sess):
+                    if val:
+                        q += f" AND {col}=?"
+                        p.append(val)
+                total_students = conn.execute(q, p).fetchone()[0] or 0
+                eligible_label = "eligible"
+        scope_sql, params = _session_scope_sql(session_id, attendance_date, alias="")
+        present_count = conn.execute(f"SELECT COUNT(DISTINCT mac_address) FROM attendance WHERE{scope_sql}", params).fetchone()[0] or 0
         batches = conn.execute("SELECT DISTINCT batch FROM students ORDER BY batch").fetchall()
         batch_list = [b[0] for b in batches if b[0]]
         batches_by_year = _get_year_batches()
-        
+
         active_now = 0
-        today_att = conn.execute("SELECT last_seen FROM attendance WHERE attendance_date=?", (attendance_date,)).fetchall()
+        today_att = conn.execute(f"SELECT last_seen FROM attendance WHERE{scope_sql}", params).fetchall()
         now = datetime.now()
         for r in today_att:
             try:
@@ -527,7 +580,9 @@ def get_attendance_stats(date: Optional[str] = None):
     rate = round((present_count / total_students * 100), 1) if total_students > 0 else 0
     return {
         "date": attendance_date,
+        "session_id": session_id,
         "total_registered": total_students,
+        "total_label": eligible_label,
         "present_today": present_count,
         "active_now": active_now,
         "attendance_rate": rate,
@@ -535,29 +590,147 @@ def get_attendance_stats(date: Optional[str] = None):
         "batches_by_year": batches_by_year
     }
 
+# ─── Attendance Sessions (Lab / Theory) ───────────────────────
+SESSION_TYPES = ["Lab", "Theory"]
+
+def _session_row_to_dict(r, present=0):
+    return {"id": r[0], "session_type": r[1], "title": r[2], "date": r[3], "start_time": r[4],
+            "year": r[5], "division": r[6], "batch": r[7], "status": r[8],
+            "started_at": r[9], "ended_at": r[10], "present_count": present}
+
+_SESSION_COLS = "id, session_type, title, session_date, start_time, year, division, batch, status, started_at, ended_at"
+
+@app.get("/api/attendance/sessions")
+def list_sessions(date: Optional[str] = None, limit: int = 100):
+    """Sessions (newest first). Pass `date` (YYYY-MM-DD) to list only that day's sessions."""
+    with sqlite3.connect(DB_PATH) as conn:
+        q, p = f"SELECT {_SESSION_COLS} FROM sessions", []
+        if date:
+            q += " WHERE session_date = ?"
+            p.append(date)
+        q += " ORDER BY id DESC LIMIT ?"
+        p.append(max(1, min(limit, 500)))
+        rows = conn.execute(q, p).fetchall()
+        counts = dict(conn.execute("SELECT session_id, COUNT(*) FROM attendance WHERE session_id IS NOT NULL GROUP BY session_id").fetchall())
+        legacy = 0
+        if date:
+            legacy = conn.execute("SELECT COUNT(*) FROM attendance WHERE session_id IS NULL AND attendance_date=?", (date,)).fetchone()[0]
+    return {"sessions": [_session_row_to_dict(r, counts.get(r[0], 0)) for r in rows], "legacy_count": legacy}
+
+@app.get("/api/attendance/sessions/active")
+def get_active_session():
+    with sqlite3.connect(DB_PATH) as conn:
+        r = conn.execute(f"SELECT {_SESSION_COLS} FROM sessions WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+        if not r:
+            return {"active": None}
+        present = conn.execute("SELECT COUNT(*) FROM attendance WHERE session_id=?", (r[0],)).fetchone()[0]
+    return {"active": _session_row_to_dict(r, present)}
+
+@app.post("/api/attendance/sessions")
+def create_session(req: SessionCreateRequest):
+    """Start a new session. Only one session can run at a time; attendance is recorded for it
+    (and only for students of its Year / Div / Batch) until it is ended."""
+    stype = (req.session_type or "").strip().title()
+    if stype not in SESSION_TYPES:
+        raise HTTPException(422, "Session type must be Lab or Theory.")
+    title = (req.title or "").strip()
+    if len(title) > 100:
+        raise HTTPException(422, "Title can be at most 100 characters.")
+
+    date_str = (req.date or datetime.now().strftime("%Y-%m-%d")).strip()
+    time_str = (req.time or datetime.now().strftime("%H:%M")).strip()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+        datetime.strptime(time_str[:5], "%H:%M")
+    except ValueError:
+        raise HTTPException(400, "Use YYYY-MM-DD for the date and HH:MM for the time.")
+    time_str = time_str[:5]
+
+    year, division, batch = (req.year or "").strip(), (req.division or "").strip(), (req.batch or "").strip()
+    if year and year not in {y["value"] for y in YEARS}:
+        raise HTTPException(422, "Select a valid year.")
+    if division and division not in DIVISIONS:
+        raise HTTPException(422, "Select a valid division.")
+    if batch:
+        valid = _get_year_batches().get(year, []) if year else [b for lst in _get_year_batches().values() for b in lst]
+        if batch not in valid:
+            raise HTTPException(422, "Select a valid batch" + (f" for {year}." if year else "."))
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+        running = conn.execute("SELECT id, session_type, title FROM sessions WHERE status='active' LIMIT 1").fetchone()
+        if running:
+            label = f"{running[1]}{' – ' + running[2] if running[2] else ''}"
+            raise HTTPException(409, f"Session #{running[0]} ({label}) is still running. End it before starting a new one.")
+        cur = conn.execute(
+            "INSERT INTO sessions (session_type, title, session_date, start_time, year, division, batch, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+            (stype, title, date_str, time_str, year, division, batch, now_str))
+        sid = cur.lastrowid
+        r = conn.execute(f"SELECT {_SESSION_COLS} FROM sessions WHERE id=?", (sid,)).fetchone()
+    engine.broadcast_event({"type": "SESSION_CHANGED", "action": "started", "session_id": sid})
+    return {"status": "ok", "message": f"{stype} session started.", "session": _session_row_to_dict(r)}
+
+@app.post("/api/attendance/sessions/{session_id}/end")
+def end_session(session_id: int):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+        r = conn.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Session not found.")
+        if r[0] != "active":
+            raise HTTPException(409, "This session has already ended.")
+        conn.execute("UPDATE sessions SET status='ended', ended_at=? WHERE id=?", (now_str, session_id))
+        present = conn.execute("SELECT COUNT(*) FROM attendance WHERE session_id=?", (session_id,)).fetchone()[0]
+    engine.broadcast_event({"type": "SESSION_CHANGED", "action": "ended", "session_id": session_id})
+    return {"status": "ok", "message": f"Session ended — {present} student(s) marked present.", "present_count": present}
+
+@app.delete("/api/attendance/sessions/{session_id}")
+def delete_session(session_id: int):
+    """Delete an ENDED session together with its attendance records."""
+    with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+        r = conn.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "Session not found.")
+        if r[0] == "active":
+            raise HTTPException(409, "End the session before deleting it.")
+        conn.execute("DELETE FROM attendance WHERE session_id=?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+    engine.broadcast_event({"type": "SESSION_CHANGED", "action": "deleted", "session_id": session_id})
+    return {"status": "ok", "message": "Session and its attendance records deleted."}
+
 @app.post("/api/attendance/checkin")
 def manual_attendance_checkin(req: ManualCheckInRequest):
+    """Admin override: mark a student in a session (default: the active one). Not limited to the session's Year/Div/Batch."""
     prn = req.prn.strip()
     status = req.status or "Present"
-    date_str = req.date or datetime.now().strftime("%Y-%m-%d")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with sqlite3.connect(DB_PATH) as conn:
+        if req.session_id is not None:
+            sess = conn.execute("SELECT id, session_date, status FROM sessions WHERE id=?", (req.session_id,)).fetchone()
+            if not sess:
+                raise HTTPException(404, "Session not found.")
+        else:
+            sess = conn.execute("SELECT id, session_date, status FROM sessions WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+            if not sess:
+                raise HTTPException(409, "No session is running. Start a session first.")
+        sid, date_str, _ = sess
         stu = conn.execute("SELECT mac_address, prn, name, batch, COALESCE(department,''), COALESCE(year,''), COALESCE(division,'') FROM students WHERE prn=?", (prn,)).fetchone()
         if not stu:
             raise HTTPException(404, f"Student with PRN '{prn}' not found.")
         mac, prn, name, batch, dept, yr, div = stu
         conn.execute("""
             INSERT INTO attendance
-                (mac_address, prn, student_name, batch, department, year, division, attendance_date, first_seen, last_seen, connection_count, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-            ON CONFLICT(mac_address, attendance_date) DO UPDATE SET
+                (mac_address, prn, student_name, batch, department, year, division, attendance_date, first_seen, last_seen, connection_count, status, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(mac_address, session_id) DO UPDATE SET
                 status = excluded.status,
                 last_seen = excluded.last_seen,
                 connection_count = attendance.connection_count + 1
-        """, (mac, prn, name, batch, dept, yr, div, date_str, now_str, now_str, status))
+        """, (mac, prn, name, batch, dept, yr, div, date_str, now_str, now_str, status, sid))
 
-    return {"status": "ok", "message": f"Attendance marked for {name} ({prn}) on {date_str} as {status}."}
+    return {"status": "ok", "message": f"Attendance marked for {name} ({prn}) in session #{sid} as {status}."}
 
 @app.delete("/api/attendance/{record_id}")
 def delete_attendance_record(record_id: int):
@@ -574,9 +747,6 @@ def get_connected_devices():
     c.execute("""
         SELECT d.ip, d.custom_name, d.auto_name, d.device_type, d.first_seen, d.last_seen, COALESCE(d.mac_address, '') 
         FROM devices d 
-        WHERE d.ip LIKE '192.168.137.%'
-           OR EXISTS (SELECT 1 FROM access_logs a WHERE a.client_ip = d.ip)
-           OR EXISTS (SELECT 1 FROM students s WHERE s.mac_address = d.mac_address)
         ORDER BY d.last_seen DESC
     """)
     rows = c.fetchall()
@@ -636,8 +806,9 @@ def admin_register_student(req: StudentAdminRegistrationRequest):
     # Check if this device is currently online and record attendance immediately
     student_obj = {"mac_address": mac, "prn": prn, "name": name, "batch": batch,
                    "department": department, "year": year, "division": division}
-    engine.record_attendance(student_obj)
-    return {"status": "ok", "message": f"{name} ({prn}) registered for {mac}. Attendance has been updated."}
+    marked = engine.record_attendance(student_obj)
+    note = "Attendance marked in the active session." if marked else "No matching active session, so no attendance was marked."
+    return {"status": "ok", "message": f"{name} ({prn}) registered for {mac}. {note}"}
 
 @app.put("/api/students/{mac}")
 def update_student(mac: str, req: StudentUpdateRequest):
@@ -675,8 +846,12 @@ def update_student(mac: str, req: StudentUpdateRequest):
                 cur = conn.execute("""UPDATE attendance SET prn=?, student_name=?, department=?, year=?, division=?, batch=?
                                       WHERE mac_address=?""", (prn, name, department, year, division, batch, mac))
             else:
-                cur = conn.execute("""UPDATE attendance SET prn=?, student_name=?, department=?, year=?, division=?, batch=?
-                                      WHERE mac_address=? AND attendance_date=?""", (prn, name, department, year, division, batch, mac, att_date))
+                if req.session_id is not None:
+                    cur = conn.execute("""UPDATE attendance SET prn=?, student_name=?, department=?, year=?, division=?, batch=?
+                                          WHERE mac_address=? AND session_id=?""", (prn, name, department, year, division, batch, mac, req.session_id))
+                else:
+                    cur = conn.execute("""UPDATE attendance SET prn=?, student_name=?, department=?, year=?, division=?, batch=?
+                                          WHERE mac_address=? AND attendance_date=?""", (prn, name, department, year, division, batch, mac, att_date))
             updated_rows = cur.rowcount
 
             # Keep the device card name in sync when it is named after the student
@@ -801,6 +976,9 @@ def get_export_schema():
                 "description": "Structured attendance timestamps and network liveness metrics for student punctuality and engagement AI models.",
                 "attributes": [
                     {"name": "attendance_id", "type": "int", "role": "identifier", "description": "Record ID"},
+                    {"name": "session_id", "type": "int", "role": "identifier", "description": "Attendance session the record belongs to (blank = legacy daily record)"},
+                    {"name": "session_type", "type": "string", "role": "categorical", "description": "Lab or Theory (Legacy for pre-session records)"},
+                    {"name": "session_title", "type": "string", "role": "metadata", "description": "Optional session title / subject"},
                     {"name": "prn", "type": "string", "role": "identifier", "description": "Student PRN"},
                     {"name": "student_name", "type": "string", "role": "metadata", "description": "Full student name"},
                     {"name": "batch", "type": "string", "role": "categorical", "description": "Academic division / batch"},
@@ -826,7 +1004,8 @@ def export_ai_dataset(
     limit: int = 5000,
     mode: str = "clean",
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    session_id: Optional[int] = None
 ):
     """
     Exports collected and stored network telemetry into curated datasets with engineered
@@ -966,9 +1145,6 @@ def export_ai_dataset(
                    COALESCE(SUM(CASE WHEN a.status = 'Blocked' THEN 1 ELSE 0 END), 0) as blocked_cnt
             FROM devices d
             LEFT JOIN access_logs a ON a.client_ip = d.ip
-            WHERE d.ip LIKE '192.168.137.%'
-               OR a.id IS NOT NULL
-               OR EXISTS (SELECT 1 FROM students s WHERE s.mac_address = d.mac_address)
             GROUP BY d.ip
             ORDER BY total_reqs DESC, d.last_seen DESC
         """)
@@ -1013,15 +1189,19 @@ def export_ai_dataset(
             })
 
     elif type == "attendance_ml":
-        c.execute("""
-            SELECT id, prn, student_name, batch, mac_address, COALESCE(ip_address,''),
-                   attendance_date, first_seen, last_seen, connection_count, COALESCE(status, 'Present'),
-                   COALESCE(department,''), COALESCE(year,''), COALESCE(division,'')
-            FROM attendance ORDER BY attendance_date DESC, first_seen ASC
-        """)
+        att_where, att_params = ("WHERE a.session_id = ?", [session_id]) if session_id is not None else ("", [])
+        c.execute(f"""
+            SELECT a.id, a.prn, a.student_name, a.batch, a.mac_address, COALESCE(a.ip_address,''),
+                   a.attendance_date, a.first_seen, a.last_seen, a.connection_count, COALESCE(a.status, 'Present'),
+                   COALESCE(a.department,''), COALESCE(a.year,''), COALESCE(a.division,''),
+                   a.session_id, COALESCE(s.session_type,''), COALESCE(s.title,'')
+            FROM attendance a LEFT JOIN sessions s ON s.id = a.session_id
+            {att_where}
+            ORDER BY a.attendance_date DESC, a.first_seen ASC
+        """, att_params)
         att_rows = c.fetchall()
         for r in att_rows:
-            aid, prn, name, bat, mac, ip, adate, first_s, last_s, count, status, dept, yr, div = r
+            aid, prn, name, bat, mac, ip, adate, first_s, last_s, count, status, dept, yr, div, sid, stype, stitle = r
             dur_mins = 0
             check_in_hour = 0.0
             is_punctual = 1
@@ -1037,6 +1217,9 @@ def export_ai_dataset(
 
             records.append({
                 "attendance_id": aid,
+                "session_id": sid if sid is not None else "",
+                "session_type": stype or "Legacy",
+                "session_title": stitle,
                 "prn": prn,
                 "student_name": name,
                 "department": dept,
@@ -1107,7 +1290,7 @@ def get_devices(mode: str = "clean"):
         liveness, seconds_ago = calculate_device_liveness(latest_ts)
 
         # Ignore unverified devices that have no requests and are not on the hotspot or registered to a student
-        if dev_req == 0 and not ip.startswith("192.168.137."):
+        if dev_req == 0 and not is_hotspot_client(ip):
             c.execute("SELECT 1 FROM students WHERE mac_address=(SELECT mac_address FROM devices WHERE ip=?)", (ip,))
             if not c.fetchone():
                 continue

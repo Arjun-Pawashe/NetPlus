@@ -13,7 +13,7 @@
 | **Author**        | Pankaj Shinde                                        |
 | **GitHub**        | https://github.com/Pankaj-Shinde-07/NetPlus          |
 | **Technology**    | Python, FastAPI, SQLite, WebSocket, Vanilla JS       |
-| **Platform**      | Windows 10/11                                        |
+| **Platform**      | Windows 10/11 and Linux with NetworkManager            |
 | **Date**          | September 2026                                       |
 
 ---
@@ -64,11 +64,12 @@ uncontrolled internet usage leads to several operational and security problems:
 ## Problem Statement (Formal)
 
 > **"Design and implement a lightweight, real-time network monitoring and
-> intelligence system for campus lab environments that can intercept, classify,
-> and display internet traffic per connected device — without requiring
-> specialized hardware, administrator privileges, or commercial software licenses
-> — while providing actionable controls such as domain blocking, per-device
-> data quotas, and downloadable audit reports for institutional governance."**
+> intelligence system for an authorized downstream network that classifies and
+> displays web requests sent through an explicitly configured HTTP proxy, while
+> providing controls such as domain blocking, per-device data quotas, and
+> downloadable audit reports. Internet sharing/routing is provided separately
+> by Windows ICS or NetworkManager; this application is not a transparent packet
+> monitor."**
 
 ## Key Challenges
 
@@ -89,9 +90,9 @@ uncontrolled internet usage leads to several operational and security problems:
 
 ## Primary Objectives
 
-1. **Real-time Traffic Monitoring**
-   Capture and display every website accessed by every connected device in
-   real-time, with sub-second latency on the monitoring dashboard.
+1. **Real-time Proxy Request Monitoring**
+   Display web requests from devices and apps configured to use the NetPlus
+   proxy in real time. Unproxied traffic is not visible to the application.
 
 2. **Per-device Attribution**
    Uniquely identify each connected device (by IP and User-Agent) and maintain
@@ -144,7 +145,7 @@ uncontrolled internet usage leads to several operational and security problems:
 
 13. **Student Attendance Check-in**
     Register a student's PRN, name, and batch against the MAC address resolved
-    from the Windows hotspot neighbor table. Record one attendance entry per
+    from the Windows downstream neighbor table. Record one attendance entry per
     device per day when its registered device generates proxy traffic.
 
 ---
@@ -183,9 +184,9 @@ uncontrolled internet usage leads to several operational and security problems:
 |  +--------------------------------------------------+              |
 +===================================+=================================+
                                     |
-                    Windows Mobile Hotspot
-                    Gateway IP: 192.168.137.1
-                    DHCP Range:  192.168.137.x
+               Windows ICS to Ethernet + Router in AP/Bridge mode
+                    Gateway IP: 192.168.137.1 (typical)
+                    DHCP:       Windows ICS (router DHCP disabled)
                                     |
               +---------------------+---------------------+
               |                     |                     |
@@ -194,10 +195,9 @@ uncontrolled internet usage leads to several operational and security problems:
      | Mobile Phone   |   | Laptop/Tablet  |   |  Any Device    |
      | Android / iOS  |   | Windows/macOS  |   |                |
      |                |   |                |   |                |
-     | Wi-Fi Connected|   | Wi-Fi Connected|   | Wi-Fi Connected|
-     | Proxy:         |   | Proxy:         |   | Proxy:         |
-     | 192.168.137.1  |   | 192.168.137.1  |   | 192.168.137.1  |
-     | Port: 8080     |   | Port: 8080     |   | Port: 8080     |
+     | Router Wi-Fi   |   | Router LAN     |   | Router Wi-Fi   |
+     | Optional proxy |   | Optional proxy |   | Optional proxy |
+     | ICS-IP:8080    |   | ICS-IP:8080    |   | ICS-IP:8080    |
      +----------------+   +----------------+   +----------------+
 ```
 
@@ -257,20 +257,21 @@ DEVICE                    ENGINE.PY (Proxy)              INTERNET
 
 ## Data Source
 
-NetPlus does **not use a pre-existing dataset**. All data is generated in
-real-time by intercepting live network traffic through the proxy gateway.
+NetPlus does **not use a pre-existing dataset**. Data is generated in real
+time from HTTP requests explicitly sent through the proxy gateway. NetPlus
+does not observe unproxied traffic on the network.
 
 ## Data Generated (Live)
 
 ### Primary Dataset: access_logs table
 
-Every HTTP/HTTPS request captured becomes one row:
+Every proxied HTTP/HTTPS request captured becomes one row:
 
 | Column | Type | Example | Description |
 |--------|------|---------|-------------|
 | id | INTEGER | 1847 | Auto-increment primary key |
 | timestamp | TEXT | 2026-09-30 14:32:10 | Exact datetime of request |
-| client_ip | TEXT | 192.168.137.5 | Device IP on hotspot network |
+| client_ip | TEXT | 192.168.137.5 | Device IP on the configured downstream network |
 | device_name | TEXT | Samsung Galaxy (Android 14) | Auto-detected from UA |
 | device_type | TEXT | mobile | mobile/tablet/laptop/desktop |
 | domain | TEXT | rr5---sn-3pm.googlevideo.com | Raw requested domain |
@@ -297,7 +298,7 @@ Every HTTP/HTTPS request captured becomes one row:
 **latency_targets table** — Network monitoring endpoints:
 - Label, host, port, enabled flag
 
-**students table** — One student registration per hotspot MAC address:
+**students table** — One student registration per downstream device MAC address:
 - MAC address, unique PRN, name, batch, registration timestamp
 
 **attendance table** — One daily check-in per registered MAC:
@@ -547,7 +548,7 @@ Every 30 seconds:
 | Theme | CSS Variables | Native | Dark/light mode |
 | Storage | localStorage | Native JS | Theme preference |
 | Notifications | Notification API | Native JS | Browser alerts |
-| Attendance identity | Windows ARP neighbor table | OS utility | Resolve hotspot IP to MAC |
+| Attendance identity | Windows ARP / Linux neighbor table | OS utility | Resolve hotspot IP to MAC |
 
 ## File Inventory
 
@@ -562,29 +563,47 @@ Every 30 seconds:
 | README.md | ~300 | Full project documentation |
 | .gitignore | 20 | Excludes DB, cache, env |
 
-## Device Setup (One-time, 2 minutes)
+## Windows Setup: Public Wi-Fi to Ethernet Router
+
+1. Connect the laptop to the public Wi-Fi, complete any captive-portal sign-in,
+   and confirm the laptop itself has internet access.
+2. Connect laptop Ethernet to a **LAN** port on the router.
+3. Configure the router in access-point/bridge mode and disable its DHCP
+   server. Windows ICS must be the only DHCP server on the downstream network.
+4. Open `ncpa.cpl`. In the Wi-Fi adapter's **Properties → Sharing** tab, enable
+   Internet Connection Sharing and select the laptop Ethernet adapter. Windows
+   ICS commonly assigns `192.168.137.1/24` to Ethernet.
+5. Connect a test device to the router and verify it receives an address and
+   has internet access. Check AP mode, DHCP, adapter selection, and captive
+   portal conditions if this fails.
+6. Run `start_netpulse.bat`; open `http://localhost:5000` on the laptop. For a
+   different ICS gateway/subnet, set `NETPLUS_GATEWAY_IP` and
+   `NETPLUS_CLIENT_NETWORK` in that Command Prompt before starting.
+
+## Device Proxy Setup
+
+On each device to monitor, configure its Wi-Fi HTTP proxy as **Manual**:
 
 ```
-PC:
-  1. Enable Windows Mobile Hotspot
-  2. Run: python server.py
-
-Phone (Android):
-  1. Connect to PC Hotspot Wi-Fi
-  2. Long press network → Modify → Advanced → Proxy: Manual
-  3. Host: 192.168.137.1 | Port: 8080
-
-Phone (iPhone):
-  1. Connect to PC Hotspot Wi-Fi
-  2. Settings → Wi-Fi → (i) → HTTP Proxy → Manual
-  3. Server: 192.168.137.1 | Port: 8080
+Android: Wi-Fi network details → Modify/Advanced → Proxy: Manual
+iPhone:  Settings → Wi-Fi → network info → HTTP Proxy → Manual
+Host:    Laptop's ICS Ethernet address (typically 192.168.137.1)
+Port:    8081 (Windows launcher default; configurable with NETPLUS_PROXY_PORT)
 ```
+
+Internet access through ICS does not require the NetPlus proxy. Only apps that
+honor the manual proxy setting are logged; HTTPS exposes the CONNECT hostname,
+not encrypted page contents or URL paths. Allow TCP port 8081 only on the
+trusted Ethernet/private network. Port 5000 is an unauthenticated dashboard
+with administrative APIs: keep it blocked on public Wi-Fi and expose it to
+downstream clients only if the student-registration redirect is intentionally
+used on a trusted network.
 
 On an unregistered device, the first plain HTTP request through the proxy
 redirects to the student registration form at
-`http://192.168.137.1:5000/attendance/register`. The proxy cannot launch a
-browser or redirect HTTPS CONNECT traffic without TLS interception. Windows
-must resolve the hotspot client's MAC from its neighbor table; randomized
+`http://<NETPLUS_GATEWAY_IP>:5000/attendance/register`. The proxy cannot launch
+a browser or redirect HTTPS CONNECT traffic without TLS interception. Windows
+must resolve the downstream client's MAC from its neighbor table; randomized
 per-network MAC addresses must stay stable for recognition to persist.
 
 ---

@@ -7,6 +7,7 @@ import sqlite3
 import os
 import sys
 import re
+import ipaddress
 import subprocess
 import secrets
 import queue
@@ -18,15 +19,26 @@ except Exception:
     pass
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "network_logs.db")
+GATEWAY_IP = os.environ.get("NETPLUS_GATEWAY_IP", "192.168.137.1").strip()
+HOTSPOT_NETWORK = ipaddress.ip_network(
+    os.environ.get("NETPLUS_CLIENT_NETWORK", "192.168.137.0/24"), strict=False
+)
+
+
+def is_hotspot_client(ip):
+    try:
+        return ipaddress.ip_address(ip) in HOTSPOT_NETWORK
+    except ValueError:
+        return False
 
 # ─── Academic structure (used by student registration dropdowns) ───
 DEPARTMENTS = [
+    "Software Engineering",
     "Computer Engineering",
     "Information Technology",
     "AI & Data Science",
     "Electronics & Telecommunication",
     "Mechanical Engineering",
-    "Civil Engineering",
 ]
 YEARS = [
     {"value": "FE", "label": "First Year (FE)"},
@@ -180,8 +192,66 @@ def init_db():
         cursor.execute("ALTER TABLE attendance ADD COLUMN status TEXT DEFAULT 'Present'")
     except Exception:
         pass
+
+    # ── Attendance sessions (Lab / Theory) ──
+    # year / division / batch = who may be marked in the session ('' means "all").
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_type TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            session_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            year TEXT NOT NULL DEFAULT '',
+            division TEXT NOT NULL DEFAULT '',
+            batch TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            started_at TEXT NOT NULL,
+            ended_at TEXT
+        )
+    """)
+    _migrate_attendance_to_sessions(cursor)
     conn.commit()
     conn.close()
+
+def _migrate_attendance_to_sessions(cursor):
+    """Old attendance rows were unique per (device, day). Rebuild the table so a device can have
+    one row per session instead. Existing rows are kept with session_id NULL ("legacy")."""
+    cols = [r[1] for r in cursor.execute("PRAGMA table_info(attendance)").fetchall()]
+    if "session_id" not in cols:
+        cursor.execute("ALTER TABLE attendance RENAME TO attendance_old")
+        cursor.execute("""
+            CREATE TABLE attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mac_address TEXT NOT NULL,
+                prn TEXT NOT NULL,
+                student_name TEXT NOT NULL,
+                batch TEXT NOT NULL,
+                department TEXT DEFAULT '',
+                year TEXT DEFAULT '',
+                division TEXT DEFAULT '',
+                attendance_date TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                connection_count INTEGER NOT NULL DEFAULT 1,
+                ip_address TEXT DEFAULT '',
+                status TEXT DEFAULT 'Present',
+                session_id INTEGER,
+                UNIQUE(mac_address, session_id)
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO attendance
+                (id, mac_address, prn, student_name, batch, department, year, division,
+                 attendance_date, first_seen, last_seen, connection_count, ip_address, status, session_id)
+            SELECT id, mac_address, prn, student_name, batch, COALESCE(department,''), COALESCE(year,''),
+                   COALESCE(division,''), attendance_date, first_seen, last_seen, connection_count,
+                   COALESCE(ip_address,''), COALESCE(status,'Present'), NULL
+            FROM attendance_old
+        """)
+        cursor.execute("DROP TABLE attendance_old")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attendance_session ON attendance(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(attendance_date)")
 
 # Known Root Brand Normalization Mapping
 ROOT_DOMAIN_RULES = [
@@ -392,6 +462,14 @@ def fallback_device_name(ip, mac=""):
 class NetworkMonitoringEngine:
     def __init__(self, host='0.0.0.0', port=8080):
         self.host = host
+        configured_port = os.environ.get("NETPLUS_PROXY_PORT")
+        if configured_port is not None:
+            try:
+                port = int(configured_port)
+            except ValueError as exc:
+                raise ValueError("NETPLUS_PROXY_PORT must be an integer from 1 to 65535") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("Proxy port must be between 1 and 65535")
         self.port = port
         self.running = False
         self.server_socket = None
@@ -573,7 +651,7 @@ class NetworkMonitoringEngine:
             if ip == '127.0.0.1':
                 auto_name, dev_type, src = 'Host PC (Localhost)', 'desktop', 'system'
             elif ua_known:
-                suffix = f"#{last_octet}" if ip.startswith('192.168.137.') else ip
+                suffix = f"#{last_octet}" if is_hotspot_client(ip) else ip
                 auto_name, dev_type, src = f"{ua_info['name']} ({suffix})", ua_info['type'], 'ua'
             else:
                 auto_name, dev_type, src = fallback_device_name(ip, mac or ''), (ua_info or {}).get('type', 'mobile'), 'fallback'
@@ -665,7 +743,7 @@ class NetworkMonitoringEngine:
                     if host:
                         cand = (host, "host")
                     elif ua_known:
-                        suffix = f"#{ip.split('.')[-1]}" if ip.startswith('192.168.137.') else ip
+                        suffix = f"#{ip.split('.')[-1]}" if is_hotspot_client(ip) else ip
                         cand = (f"{ua_info['name']} ({suffix})", "ua")
                     elif cur_pri == 0:
                         cand = (fallback_device_name(ip, mac), "fallback")
@@ -766,7 +844,7 @@ class NetworkMonitoringEngine:
         return bool(dev), logs
 
     def get_mac_for_ip(self, ip):
-        """Resolve a client's current MAC from local cache or the Windows ARP table."""
+        """Resolve a client's current MAC from the local neighbor table."""
         if not ip:
             return None
         if ip in ("127.0.0.1", "localhost", "::1"):
@@ -774,19 +852,43 @@ class NetworkMonitoringEngine:
         if ip in self._mac_cache and time.time() - self._mac_cache[ip][1] < 15:
             return self._mac_cache[ip][0]
         try:
-            result = subprocess.run(
-                ["arp", "-a", ip], capture_output=True, text=True,
-                timeout=2, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-            match = re.search(r"\b" + re.escape(ip) + r"\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b", result.stdout, re.I)
-            if not match:
-                result2 = subprocess.run(
-                    ["arp", "-a"], capture_output=True, text=True,
+            if os.name == "nt":
+                result = subprocess.run(
+                    ["arp", "-a", ip], capture_output=True, text=True,
                     timeout=2, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 )
-                match = re.search(r"\b" + re.escape(ip) + r"\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b", result2.stdout, re.I)
-            
-            mac = match.group(1).replace("-", ":").lower() if match else None
+                match = re.search(
+                    r"\b" + re.escape(ip) + r"\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b",
+                    result.stdout, re.I
+                )
+                if not match:
+                    result = subprocess.run(
+                        ["arp", "-a"], capture_output=True, text=True, timeout=2, check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    )
+                    match = re.search(
+                        r"\b" + re.escape(ip) + r"\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b",
+                        result.stdout, re.I
+                    )
+                mac = match.group(1).replace("-", ":").lower() if match else None
+            else:
+                mac = None
+                try:
+                    result = subprocess.run(
+                        ["ip", "neigh", "show", "to", ip],
+                        capture_output=True, text=True, timeout=2, check=False
+                    )
+                    match = re.search(r"\blladdr\s+(([0-9a-f]{2}:){5}[0-9a-f]{2})\b", result.stdout, re.I)
+                    mac = match.group(1).lower() if match else None
+                except FileNotFoundError:
+                    pass
+                if not mac:
+                    with open("/proc/net/arp", encoding="ascii") as arp_table:
+                        for line in arp_table:
+                            fields = line.split()
+                            if len(fields) >= 4 and fields[0] == ip and fields[3] != "00:00:00:00:00:00":
+                                mac = fields[3].lower()
+                                break
             if mac:
                 self._mac_cache[ip] = (mac, time.time())
             return mac
@@ -794,20 +896,42 @@ class NetworkMonitoringEngine:
             return None
 
     def scan_connected_devices(self):
-        """Scan ARP table for connected dynamic devices, update last_seen and auto-mark attendance for recognized student devices."""
+        """Scan the local neighbor table for hotspot clients and update their status."""
         found = []
         try:
-            r = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if os.name == "nt":
+                r = subprocess.run(
+                    ["arp", "-a"], capture_output=True, text=True, timeout=2,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+                entries = []
+                for line in r.stdout.splitlines():
+                    match = re.match(
+                        r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s+dynamic",
+                        line
+                    )
+                    if match:
+                        entries.append((match.group(1), match.group(2).replace("-", ":").lower()))
+            else:
+                r = subprocess.run(
+                    ["ip", "neigh", "show"], capture_output=True, text=True,
+                    timeout=2, check=False
+                )
+                entries = []
+                for line in r.stdout.splitlines():
+                    match = re.match(
+                        r"^\s*(\d+\.\d+\.\d+\.\d+)\s+.*?\blladdr\s+(([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})\b",
+                        line
+                    )
+                    if match:
+                        entries.append((match.group(1), match.group(2).lower()))
+
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for line in r.stdout.splitlines():
-                m = re.match(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s+dynamic", line)
-                if m:
-                    ip = m.group(1)
-                    mac = m.group(2).replace("-", ":").lower()
-                    if ip.startswith("224.") or ip.startswith("239.") or ip.endswith(".255") or ip == "255.255.255.255":
-                        continue
-                    self._mac_cache[ip] = (mac, time.time())
-                    found.append((ip, mac))
+            for ip, mac in entries:
+                if not is_hotspot_client(ip):
+                    continue
+                self._mac_cache[ip] = (mac, time.time())
+                found.append((ip, mac))
 
             if found:
                 to_record = []
@@ -822,8 +946,6 @@ class NetworkMonitoringEngine:
                             to_record.append(({"mac_address": stu[0], "prn": stu[1], "name": stu[2], "batch": stu[3],
                                                "department": stu[4], "year": stu[5], "division": stu[6]}, ip))
                         if self._is_removed(ip, mac):
-                            continue
-                        if not stu and not ip.startswith("192.168.137."):
                             continue
                         c.execute("SELECT ip FROM devices WHERE ip = ?", (ip,))
                         if c.fetchone():
@@ -867,26 +989,52 @@ class NetworkMonitoringEngine:
         except sqlite3.Error:
             return None
 
+    def get_active_session(self):
+        """Return the currently running attendance session (dict) or None."""
+        try:
+            with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+                row = conn.execute(
+                    "SELECT id, session_type, title, session_date, year, division, batch "
+                    "FROM sessions WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        return {"id": row[0], "session_type": row[1], "title": row[2], "session_date": row[3],
+                "year": row[4], "division": row[5], "batch": row[6]}
+
+    @staticmethod
+    def student_in_session(student, session):
+        """A session only accepts students of its chosen Year / Div / Batch ('' = any)."""
+        for key in ("year", "division", "batch"):
+            wanted = session.get(key, "") or ""
+            if wanted and (student.get(key, "") or "") != wanted:
+                return False
+        return True
+
     def record_attendance(self, student, ip=""):
-        """Upsert today's attendance row. Broadcasts a check-in event only the FIRST time
-        a student is seen on a given day, so the dashboard popup is not repeated."""
+        """Mark the student present in the ACTIVE session only. Returns True if a record was
+        written/updated, False if there is no active session or the student is not part of it.
+        The dashboard popup is broadcast only the first time a student is seen in a session."""
+        session = self.get_active_session()
+        if not session or not self.student_in_session(student, session):
+            return False
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        today = now[:10]
         dept = student.get("department", "") or ""
         year = student.get("year", "") or ""
         div = student.get("division", "") or ""
         try:
             with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
                 already = conn.execute(
-                    "SELECT 1 FROM attendance WHERE mac_address=? AND attendance_date=?",
-                    (student["mac_address"], today)
+                    "SELECT 1 FROM attendance WHERE mac_address=? AND session_id=?",
+                    (student["mac_address"], session["id"])
                 ).fetchone() is not None
                 conn.execute("""
                     INSERT INTO attendance
                         (mac_address, prn, student_name, batch, department, year, division,
-                         attendance_date, first_seen, last_seen, connection_count, ip_address, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'Present')
-                    ON CONFLICT(mac_address, attendance_date) DO UPDATE SET
+                         attendance_date, first_seen, last_seen, connection_count, ip_address, status, session_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'Present', ?)
+                    ON CONFLICT(mac_address, session_id) DO UPDATE SET
                         last_seen=excluded.last_seen,
                         connection_count=attendance.connection_count + 1,
                         prn=excluded.prn, student_name=excluded.student_name, batch=excluded.batch,
@@ -894,11 +1042,13 @@ class NetworkMonitoringEngine:
                         ip_address=CASE WHEN excluded.ip_address != '' THEN excluded.ip_address ELSE attendance.ip_address END,
                         status='Present'
                 """, (student["mac_address"], student["prn"], student["name"], student["batch"],
-                      dept, year, div, today, now, now, ip or ""))
+                      dept, year, div, session["session_date"], now, now, ip or "", session["id"]))
 
             if not already:
                 self.broadcast_event({
                     "type": "ATTENDANCE_RECORDED",
+                    "session_id": session["id"],
+                    "session_type": session["session_type"],
                     "student_name": student["name"],
                     "prn": student["prn"],
                     "batch": student["batch"],
@@ -909,8 +1059,10 @@ class NetworkMonitoringEngine:
                     "ip_address": ip,
                     "time": now
                 })
+            return True
         except Exception as e:
             print(f"Error recording attendance: {e}")
+            return False
 
     # ── "Join" prompt: show the registration page only once per device ──
     def _prompt_key(self, ip, mac):
@@ -1101,14 +1253,15 @@ class NetworkMonitoringEngine:
             if student:
                 self.record_attendance(student)
 
-            # Plain HTTP can be redirected to the registration page. HTTPS CONNECT
-            # cannot be redirected safely without intercepting TLS certificates.
-            is_local_portal = host.lower().strip("[]") in {"192.168.137.1", "localhost", "127.0.0.1"}
-            if (method != 'CONNECT' and not is_local_portal and not student and not is_background
-                    and not self.was_prompted(client_ip, mac_address)):
-                self.mark_prompted(client_ip, mac_address)
+            # Keep unregistered devices on the registration page for every plain
+            # HTTP request. Otherwise captive-portal checks may see internet access
+            # after the first redirect and dismiss the registration screen.
+            is_local_portal = host.lower().strip("[]") in {GATEWAY_IP, "localhost", "127.0.0.1"}
+            if method != 'CONNECT' and not is_local_portal and not student and not is_background:
+                if not self.was_prompted(client_ip, mac_address):
+                    self.mark_prompted(client_ip, mac_address)
                 token = self.issue_registration_token(client_ip)
-                location = f"http://192.168.137.1:5000/attendance/register?token={token}"
+                location = f"http://{GATEWAY_IP}:5000/attendance/register?token={token}"
                 response = (
                     "HTTP/1.1 302 Found\r\n"
                     f"Location: {location}\r\n"
