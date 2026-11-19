@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetPulse NOC v4.0 — Campus Network Intelligence</title>
+    <meta name="description" content="Real-time campus network monitoring — track devices, websites, bandwidth, and latency through your gateway.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <canvas id="bgCanvas" class="bg-canvas"></canvas>
+
+    <!-- TOPBAR -->
+    <header class="topbar">
+        <div class="topbar-brand">
+            <div class="brand-logo">
+                <i class="fa-solid fa-satellite-dish"></i>
+                <span class="logo-ring"></span>
+            </div>
+            <div class="brand-text">
+                <div class="brand-name">NETPULSE <span class="brand-chip">v4.0</span></div>
+                <div class="brand-sub">Campus Lab Network Intelligence &bull; Live Telemetry</div>
+            </div>
+        </div>
+
+        <div class="topbar-center">
+            <nav class="topbar-nav-tabs">
+                <button class="topbar-nav-tab active" id="tabBtnNOC" data-tab="tabNetworkNOC">
+                    <i class="fa-solid fa-chart-line"></i>
+                    <span>Network NOC</span>
+                </button>
+                <button class="topbar-nav-tab" id="tabBtnAttendance" data-tab="tabAttendance">
+                    <i class="fa-solid fa-user-check"></i>
+                    <span>Smart Attendance</span>
+                    <span class="tab-chip-pill" id="navAttendanceCount">0 Live</span>
+                </button>
+                <button class="topbar-nav-tab" id="tabBtnAI" data-tab="tabAIExport">
+                    <i class="fa-solid fa-brain"></i>
+                    <span>AI Analytics &amp; Export</span>
+                    <span class="tab-chip-pill accent">ML Studio</span>
+                </button>
+            </nav>
+        </div>
+
+        <div class="topbar-actions">
+            <div class="ws-badge" id="wsStatus"><span class="ws-dot"></span><span class="ws-text">Live</span></div>
+
+            <div class="proxy-pill hide-sm" id="gatewayBox" title="Click to copy gateway IP">
+                <div class="proxy-icon"><i class="fa-solid fa-tower-broadcast"></i></div>
+                <div class="proxy-info">
+                    <span class="proxy-label">GATEWAY</span>
+                    <span class="proxy-addr">192.168.137.1 (DNS:53) <i class="fa-regular fa-copy"></i></span>
+                </div>
+            </div>
+
+            <button class="topbar-btn btn-ghost-act" id="btnThemeToggle" title="Toggle Light/Dark Mode">
+                <i class="fa-solid fa-moon" id="themeIcon"></i>
+            </button>
+            <button class="topbar-btn btn-primary-act" id="btnOpenGuide">
+                <i class="fa-solid fa-mobile-screen-button"></i> <span class="hide-sm">Setup</span>
+            </button>
+            <button class="topbar-btn btn-ghost-act" id="btnOpenPolicy">
+                <i class="fa-solid fa-shield-halved"></i> <span class="hide-sm">Policy</span>
+            </button>
+            <button class="topbar-btn btn-ghost-act" id="btnOpenQuota">
+                <i class="fa-solid fa-gauge-high"></i> <span class="hide-sm">Quotas</span>
+            </button>
+            <button class="topbar-btn btn-success-act" id="btnDownloadReport" title="Download HTML Audit Report">
+                <i class="fa-solid fa-file-lines"></i> <span class="hide-sm">Report</span>
+            </button>
+            <button class="topbar-btn btn-ghost-act" id="btnExportCSV" title="Export Data">
+                <i class="fa-solid fa-download"></i> <span class="hide-sm">Export</span>
+            </button>
+            <button class="topbar-btn btn-danger-act" id="btnClearLogs" title="Clear all logs">
+                <i class="fa-solid fa-trash-can"></i>
+            </button>
+        </div>
+    </header>
+
+    <main class="app-shell">
+        <!-- ═══════════════════════════════════════════════════════ -->
+        <!-- TAB 1: NETWORK NOC DASHBOARD                          -->
+        <!-- ═══════════════════════════════════════════════════════ -->
+        <div class="app-tab-pane active" id="tabNetworkNOC">
+            <!-- KPI CARDS -->
+            <section class="kpi-row">
+            <div class="kpi-card" style="--accent:#3b82f6">
+                <div class="kpi-glow" style="background:#3b82f6"></div>
+                <div class="kpi-top">
+                    <div class="kpi-ico" style="background:rgba(59,130,246,.15);color:#60a5fa"><i class="fa-solid fa-globe"></i></div>
+                    <div class="kpi-trend up"><i class="fa-solid fa-arrow-trend-up"></i> Live</div>
+                </div>
+                <div class="kpi-val" id="valTotalRequests">0</div>
+                <div class="kpi-title">WEBSITES VISITED</div>
+                <div class="kpi-sub"><i class="fa-solid fa-filter-circle-xmark"></i> Background filtered</div>
+                <div class="kpi-bar"><div class="kpi-bar-fill" style="background:#3b82f6;width:70%"></div></div>
+            </div>
+            <div class="kpi-card" style="--accent:#10b981">
+                <div class="kpi-glow" style="background:#10b981"></div>
+                <div class="kpi-top">
+                    <div class="kpi-ico" style="background:rgba(16,185,129,.15);color:#34d399"><i class="fa-solid fa-mobile-screen"></i></div>
+                    <div class="kpi-trend up"><i class="fa-solid fa-signal"></i> Active</div>
+                </div>
+                <div class="kpi-val" id="valActiveDevices">0</div>
+                <div class="kpi-title">CONNECTED DEVICES</div>
+                <div class="kpi-sub" id="subActiveDevices"><i class="fa-solid fa-circle-dot"></i> Live Heartbeat</div>
+                <div class="kpi-bar"><div class="kpi-bar-fill" style="background:#10b981;width:50%"></div></div>
+            </div>
+            <div class="kpi-card" style="--accent:#a855f7">
+                <div class="kpi-glow" style="background:#a855f7"></div>
+                <div class="kpi-top">
+                    <div class="kpi-ico" style="background:rgba(168,85,247,.15);color:#c084fc"><i class="fa-solid fa-database"></i></div>
+                    <div class="kpi-trend neutral"><i class="fa-solid fa-wave-square"></i> Tracked</div>
+                </div>
+                <div class="kpi-val" id="valTotalBandwidth">0 B</div>
+                <div class="kpi-title">BANDWIDTH USED</div>
+                <div class="kpi-sub"><i class="fa-solid fa-arrows-up-down"></i> Up + Down</div>
+                <div class="kpi-bar"><div class="kpi-bar-fill" style="background:#a855f7;width:40%"></div></div>
+            </div>
+            <div class="kpi-card" style="--accent:#f43f5e">
+                <div class="kpi-glow" style="background:#f43f5e"></div>
+                <div class="kpi-top">
+                    <div class="kpi-ico" style="background:rgba(244,63,94,.15);color:#fb7185"><i class="fa-solid fa-ban"></i></div>
+                    <div class="kpi-trend down"><i class="fa-solid fa-shield-virus"></i> Enforced</div>
+                </div>
+                <div class="kpi-val" id="valTotalBlocked">0</div>
+                <div class="kpi-title">POLICY BLOCKS</div>
+                <div class="kpi-sub"><i class="fa-solid fa-fire-flame-curved"></i> Firewall Active</div>
+                <div class="kpi-bar"><div class="kpi-bar-fill" style="background:#f43f5e;width:20%"></div></div>
+            </div>
+        </section>
+
+        <!-- DEVICE MATRIX -->
+        <section class="panel devices-panel">
+            <div class="panel-header">
+                <div class="panel-title-group">
+                    <div class="panel-icon" style="background:rgba(6,182,212,.12);color:#06b6d4"><i class="fa-solid fa-users-gear"></i></div>
+                    <div><h2>Connected Device Matrix</h2><p>Real-time liveness, bandwidth &amp; activity per device</p></div>
+                </div>
+                <div class="panel-actions">
+                    <button class="icon-btn" id="btnRefreshDevices" title="Refresh"><i class="fa-solid fa-rotate"></i></button>
+                    <div class="device-count-badge" id="devicesCounter">0 Devices</div>
+                </div>
+            </div>
+            <div class="devices-grid" id="devicesDeckContainer">
+                <div class="empty-state">
+                    <div class="empty-icon"><i class="fa-solid fa-plug-circle-xmark"></i></div>
+                    <h3>No Devices Connected</h3>
+                    <p>Connect your phone to the PC Hotspot and configure proxy <code>192.168.137.1 (DNS:53)</code></p>
+                    <button class="btn-setup-link" onclick="document.getElementById('guideModal').classList.add('active')">
+                        <i class="fa-solid fa-bolt"></i> Quick Setup Guide
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- CHARTS ROW (3-column triptych) -->
+        <div class="charts-triptych">
+            <div class="chart-panel large-chart">
+                <div class="chart-panel-header">
+                    <div class="chart-panel-title">
+                        <i class="fa-solid fa-chart-line" style="color:#6366f1"></i>
+                        <div><h3>Activity Timeline</h3><span>Live request stream</span></div>
+                    </div>
+                    <div class="streaming-pill"><span class="stream-dot"></span> LIVE</div>
+                </div>
+                <div class="chart-wrap" style="height:190px"><canvas id="timelineChart"></canvas></div>
+            </div>
+            <div class="chart-panel">
+                <div class="chart-panel-header">
+                    <div class="chart-panel-title">
+                        <i class="fa-solid fa-chart-pie" style="color:#a855f7"></i>
+                        <div><h3>Category Split</h3><span>Domain classification</span></div>
+                    </div>
+                </div>
+                <div class="chart-wrap" style="height:190px"><canvas id="categoryChart"></canvas></div>
+            </div>
+            <div class="chart-panel">
+                <div class="chart-panel-header">
+                    <div class="chart-panel-title">
+                        <i class="fa-solid fa-ranking-star" style="color:#06b6d4"></i>
+                        <div><h3>Top Sites</h3><span>By frequency</span></div>
+                    </div>
+                </div>
+                <div class="chart-wrap" style="height:190px"><canvas id="topDomainsChart"></canvas></div>
+            </div>
+        </div>
+
+        <!-- BANDWIDTH TREND + LATENCY MONITOR (2-column) -->
+        <div class="two-col-row">
+            <!-- Bandwidth Trend -->
+            <div class="chart-panel">
+                <div class="chart-panel-header">
+                    <div class="chart-panel-title">
+                        <i class="fa-solid fa-chart-area" style="color:#10b981"></i>
+                        <div><h3>Bandwidth Trend</h3><span>Hourly usage (last 24h)</span></div>
+                    </div>
+                    <button class="icon-btn" id="btnRefreshBandwidth" title="Refresh"><i class="fa-solid fa-rotate"></i></button>
+                </div>
+                <div class="chart-wrap" style="height:180px"><canvas id="bandwidthChart"></canvas></div>
+            </div>
+
+            <!-- Latency Monitor -->
+            <div class="chart-panel latency-panel">
+                <div class="chart-panel-header">
+                    <div class="chart-panel-title">
+                        <i class="fa-solid fa-heartbeat" style="color:#f43f5e"></i>
+                        <div><h3>Latency Monitor</h3><span>Network response times (ping every 30s)</span></div>
+                    </div>
+                    <button class="icon-btn" id="btnOpenLatencyTargets" title="Manage targets"><i class="fa-solid fa-sliders"></i></button>
+                </div>
+                <div class="latency-targets-grid" id="latencyTargetsGrid">
+                    <div class="latency-loading"><i class="fa-solid fa-spinner fa-spin"></i> Measuring…</div>
+                </div>
+                <div class="chart-wrap" style="height:130px;margin-top:12px"><canvas id="latencyChart"></canvas></div>
+            </div>
+        </div>
+
+        <!-- LIVE LOG FEED -->
+        <section class="panel log-panel">
+            <div class="panel-header log-panel-header">
+                <div class="panel-title-group">
+                    <div class="panel-icon" style="background:rgba(99,102,241,.12);color:#6366f1"><i class="fa-solid fa-list-check"></i></div>
+                    <div><h2>Live Website Access Feed</h2><p>Real-time audit of every site accessed through the gateway</p></div>
+                </div>
+
+                <div class="log-controls">
+                    <!-- Mode toggle -->
+                    <div class="mode-switcher">
+                        <button class="mode-btn active" id="btnModeClean"><i class="fa-solid fa-sparkles"></i> Clean</button>
+                        <button class="mode-btn" id="btnModeRaw"><i class="fa-solid fa-network-wired"></i> Raw</button>
+                    </div>
+
+                    <!-- Date range -->
+                    <div class="date-range-group">
+                        <label><i class="fa-regular fa-calendar"></i></label>
+                        <input type="date" id="filterDateFrom" class="date-inp" title="From date">
+                        <span class="date-sep">→</span>
+                        <input type="date" id="filterDateTo" class="date-inp" title="To date">
+                        <button class="icon-btn" id="btnClearDates" title="Clear dates"><i class="fa-solid fa-xmark"></i></button>
+                    </div>
+
+                    <!-- Device pills -->
+                    <div class="device-pills" id="deviceFilterPills">
+                        <button class="d-pill active" data-ip="All">&#127760; All</button>
+                    </div>
+
+                    <!-- Search -->
+                    <div class="search-box">
+                        <i class="fa-solid fa-magnifying-glass"></i>
+                        <input type="text" id="logSearch" placeholder="Search site or IP...">
+                    </div>
+
+                    <!-- Filters -->
+                    <select id="categoryFilter" class="filter-select">
+                        <option value="All">All Categories</option>
+                        <option value="Academic &amp; Learning">&#127891; Academic</option>
+                        <option value="Entertainment &amp; Social">&#127902; Entertainment</option>
+                        <option value="Gaming &amp; Arcade">&#127918; Gaming</option>
+                        <option value="Search &amp; Knowledge">&#128269; Search</option>
+                        <option value="Messaging &amp; Collab">&#128172; Messaging</option>
+                        <option value="Proxy &amp; Bypass">&#128737; Proxy</option>
+                        <option value="General Web">&#127760; General</option>
+                    </select>
+                    <select id="statusFilter" class="filter-select">
+                        <option value="All">All Status</option>
+                        <option value="Allowed">Allowed</option>
+                        <option value="Blocked">Blocked</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="table-scroll">
+                <table class="log-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th><th>Device</th><th>IP</th>
+                            <th>Website</th><th>Category</th>
+                            <th>Size</th><th>Status</th><th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="logsTableBody">
+                        <tr class="table-empty-row">
+                            <td colspan="8"><i class="fa-solid fa-satellite-dish"></i> Waiting for traffic…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+        </div> <!-- ═══════ /tabNetworkNOC ═══════ -->
+
+        <!-- ═══════════════════════════════════════════════════════ -->
+        <!-- TAB 2: SMART ATTENDANCE SYSTEM (SEPARATE FUNCTIONALITY) -->
+        <!-- ═══════════════════════════════════════════════════════ -->
+        <div class="app-tab-pane" id="tabAttendance">
+            <div class="attendance-suite">
+                <!-- Top Attendance KPI Row -->
+                <div class="attendance-kpi-grid">
+                    <div class="att-kpi-card" style="border-top: 3px solid #3b82f6;">
+                        <div class="att-kpi-header">
+                            <div class="att-kpi-icon" style="background:rgba(59,130,246,0.15);color:#60a5fa"><i class="fa-solid fa-graduation-cap"></i></div>
+                            <span class="att-kpi-badge" style="background:rgba(59,130,246,0.12);color:#60a5fa">Directory</span>
+                        </div>
+                        <div class="att-kpi-val" id="valAttRegistered">0</div>
+                        <div class="att-kpi-title">REGISTERED STUDENTS</div>
+                        <div class="att-kpi-sub"><i class="fa-solid fa-id-card"></i> Total student profiles</div>
+                    </div>
+
+                    <div class="att-kpi-card" style="border-top: 3px solid #10b981;">
+                        <div class="att-kpi-header">
+                            <div class="att-kpi-icon" style="background:rgba(16,185,129,0.15);color:#34d399"><i class="fa-solid fa-user-check"></i></div>
+                            <span class="att-kpi-badge" style="background:rgba(16,185,129,0.12);color:#34d399" id="valAttRateBadge">0% Rate</span>
+                        </div>
+                        <div class="att-kpi-val" id="valAttPresent">0</div>
+                        <div class="att-kpi-title">PRESENT TODAY</div>
+                        <div class="att-kpi-sub"><i class="fa-solid fa-calendar-check"></i> Auto-marked upon connect</div>
+                    </div>
+
+                    <div class="att-kpi-card" style="border-top: 3px solid #06b6d4;">
+                        <div class="att-kpi-header">
+                            <div class="att-kpi-icon" style="background:rgba(6,182,212,0.15);color:#22d3ee"><i class="fa-solid fa-wifi"></i></div>
+                            <span class="att-kpi-badge" style="background:rgba(6,182,212,0.12);color:#22d3ee"><span class="pulse-green"></span> Live</span>
+                        </div>
+                        <div class="att-kpi-val" id="valAttActiveNow">0</div>
+                        <div class="att-kpi-title">ACTIVE ON NETWORK</div>
+                        <div class="att-kpi-sub"><i class="fa-solid fa-signal"></i> Currently communicating</div>
+                    </div>
+
+                    <div class="att-kpi-card" style="border-top: 3px solid #a855f7;">
+                        <div class="att-kpi-header">
+                            <div class="att-kpi-icon" style="background:rgba(168,85,247,0.15);color:#c084fc"><i class="fa-solid fa-satellite-dish"></i></div>
+                            <span class="att-kpi-badge" style="background:rgba(168,85,247,0.12);color:#c084fc">Radar</span>
+                        </div>
+                        <div class="att-kpi-val" id="valAttRadarStatus" style="font-size:20px;margin-top:6px">ACTIVE</div>
+                        <div class="att-kpi-title">AUTO-DETECTION SERVICE</div>
+                        <div class="att-kpi-sub"><i class="fa-solid fa-bolt"></i> Windows ARP + Npcap/DNS Sniffer</div>
+                    </div>
+                </div>
+
+                <!-- Attendance Toolbar & Controls -->
+                <div class="attendance-toolbar">
+                    <div class="attendance-filters">
+                        <label style="font-size:12px;font-weight:700;color:var(--tx-3);display:flex;align-items:center;gap:6px">
+                            <i class="fa-regular fa-calendar"></i> Date:
+                        </label>
+                        <input type="date" id="attendanceDate" class="filter-select" aria-label="Attendance date">
+                        <button class="outline-btn" id="btnTodayAttendance" style="padding:6px 12px;font-size:11px"><i class="fa-solid fa-calendar-day"></i> Today</button>
+                        
+                        <select id="attendanceDeptFilter" class="filter-select" aria-label="Department filter" style="margin-left:8px">
+                            <option value="All">All Departments</option>
+                        </select>
+                        <select id="attendanceYearFilter" class="filter-select" aria-label="Year filter">
+                            <option value="All">All Years</option>
+                        </select>
+                        <select id="attendanceDivFilter" class="filter-select" aria-label="Division filter">
+                            <option value="All">All Divs</option>
+                        </select>
+                        <select id="attendanceBatchFilter" class="filter-select" aria-label="Batch filter">
+                            <option value="All">All Batches</option>
+                        </select>
+
+                        <div class="search-box" style="margin-left:4px">
+                            <i class="fa-solid fa-magnifying-glass"></i>
+                            <input type="text" id="attendanceSearchInput" placeholder="Search student name, PRN or MAC…">
+                        </div>
+                    </div>
+
+                    <div class="attendance-actions">
+                        <button class="solid-btn" id="btnOpenStudentModal">
+                            <i class="fa-solid fa-user-plus"></i> Register Student / Link
+                        </button>
+                        <button class="outline-btn" id="btnExportAttendanceCSV" title="Export attendance records">
+                            <i class="fa-solid fa-file-csv"></i> Export CSV
+                        </button>
+                        <button class="icon-btn" id="btnRefreshAttendance" title="Refresh attendance">
+                            <i class="fa-solid fa-rotate"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Attendance Split Grid (Ledger + Radar) -->
+                <div class="attendance-split-grid">
+                    <!-- Main Ledger -->
+                    <div class="attendance-ledger-card">
+                        <div class="panel-header">
+                            <div class="panel-title-group">
+                                <div class="panel-icon" style="background:rgba(16,185,129,0.12);color:#10b981"><i class="fa-solid fa-clipboard-user"></i></div>
+                                <div>
+                                    <h3 style="font-size:16px;font-weight:700;color:var(--tx-1);margin:0">Daily Attendance Ledger</h3>
+                                    <p style="font-size:12px;color:var(--tx-3);margin:2px 0 0">Verified check-ins by recognized device connection</p>
+                                </div>
+                            </div>
+                            <span class="device-count-badge" id="attendanceCount">0 Present</span>
+                        </div>
+                        <div class="table-scroll" style="max-height:540px">
+                            <table class="log-table">
+                                <thead>
+                                    <tr>
+                                        <th>PRN</th>
+                                        <th>Student</th>
+                                        <th>Department</th>
+                                        <th>Year</th>
+                                        <th>Div</th>
+                                        <th>Batch</th>
+                                        <th>Device (MAC &amp; IP)</th>
+                                        <th>Check-In (First Seen)</th>
+                                        <th>Last Active</th>
+                                        <th>Duration</th>
+                                        <th>Requests</th>
+                                        <th>Status</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="attendanceTableBody">
+                                    <tr class="table-empty-row"><td colspan="13">Loading attendance ledger…</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Side Radar: Realtime Discovered Devices -->
+                    <div class="connected-radar-card">
+                        <div class="panel-header" style="border-bottom:1px solid var(--border-dim);padding:14px 18px">
+                            <div class="panel-title-group">
+                                <div class="panel-icon" style="background:rgba(6,182,212,0.12);color:#06b6d4"><i class="fa-solid fa-tower-broadcast"></i></div>
+                                <div>
+                                    <h4 style="font-size:14px;font-weight:700;color:var(--tx-1);margin:0">Live Device Radar</h4>
+                                    <p style="font-size:11px;color:var(--tx-3);margin:2px 0 0">Connected TL-WR740N Wi-Fi &amp; LAN devices</p>
+                                </div>
+                            </div>
+                            <button class="icon-btn" id="btnRefreshRadar" title="Scan network"><i class="fa-solid fa-rotate"></i></button>
+                        </div>
+                        <div class="radar-scroll-body" id="radarDeviceList">
+                            <div class="loading-cell"><i class="fa-solid fa-spinner fa-spin"></i> Scanning network devices…</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════════════════════════════════════════════════════ -->
+        <!-- TAB 3: AI ANALYTICS & ML DATASET EXPORT STUDIO        -->
+        <!-- ═══════════════════════════════════════════════════════ -->
+        <div class="app-tab-pane" id="tabAIExport">
+            <div class="ai-export-suite">
+                <!-- Local AI Anomaly Analysis Panel -->
+                <section class="panel ai-analysis-panel">
+                    <div class="panel-header">
+                        <div class="panel-title-group">
+                            <div class="panel-icon" style="background:rgba(168,85,247,.12);color:#a855f7"><i class="fa-solid fa-brain"></i></div>
+                            <div>
+                                <h2>AI Traffic Anomaly Intelligence</h2>
+                                <p>Local machine learning from device network behavior · 30-day rolling baseline</p>
+                            </div>
+                        </div>
+                        <div class="panel-actions">
+                            <span class="device-count-badge" id="aiTrainingStatus">Learning from traffic</span>
+                            <button class="icon-btn" id="btnRefreshAI" title="Refresh analysis"><i class="fa-solid fa-rotate"></i></button>
+                        </div>
+                    </div>
+                    <div class="ai-analysis-content" id="aiAnalysisContent">
+                        <div class="latency-loading"><i class="fa-solid fa-spinner fa-spin"></i> Analyzing network telemetry…</div>
+                    </div>
+                </section>
+
+                <!-- AI Dataset Export Studio -->
+                <section class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title-group">
+                            <div class="panel-icon" style="background:linear-gradient(135deg,rgba(99,102,241,.2),rgba(6,182,212,.2));color:#818cf8"><i class="fa-solid fa-database"></i></div>
+                            <div>
+                                <h2>AI &amp; Machine Learning Dataset Studio</h2>
+                                <p>Export rich, engineered network telemetry datasets formatted for AI training, scikit-learn, PyTorch &amp; Pandas</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="padding: 20px 24px; display: flex; flex-direction: column; gap: 20px;">
+                        <!-- Dataset Type Selection Cards -->
+                        <div class="ai-dataset-cards-grid">
+                            <!-- Card 1: Traffic ML Feature Matrix -->
+                            <div class="dataset-card selected" data-dataset-type="traffic_features">
+                                <div class="dataset-card-top">
+                                    <div class="dataset-card-icon" style="background:rgba(99,102,241,0.15);color:#818cf8"><i class="fa-solid fa-microchip"></i></div>
+                                    <input type="radio" name="aiDatasetRadio" value="traffic_features" checked class="dataset-radio">
+                                </div>
+                                <h4>Traffic ML Feature Matrix</h4>
+                                <p>30 engineered features including cyclical temporal encoding, log-scaled bytes, categorical encodings, and risk scores.</p>
+                                <div class="dataset-meta-chips">
+                                    <span class="meta-chip">30 Features</span>
+                                    <span class="meta-chip">Classification</span>
+                                    <span class="meta-chip">Anomaly Det.</span>
+                                </div>
+                            </div>
+
+                            <!-- Card 2: Device Behavioral Profiles -->
+                            <div class="dataset-card" data-dataset-type="device_profiles">
+                                <div class="dataset-card-top">
+                                    <div class="dataset-card-icon" style="background:rgba(6,182,212,0.15);color:#06b6d4"><i class="fa-solid fa-users-viewfinder"></i></div>
+                                    <input type="radio" name="aiDatasetRadio" value="device_profiles" class="dataset-radio">
+                                </div>
+                                <h4>Device Behavior Vectors</h4>
+                                <p>Aggregated behavioral feature vectors per device for unsupervised clustering, outlier detection &amp; student profiling.</p>
+                                <div class="dataset-meta-chips">
+                                    <span class="meta-chip">15 Metrics</span>
+                                    <span class="meta-chip">Clustering</span>
+                                    <span class="meta-chip">K-Means</span>
+                                </div>
+                            </div>
+
+                            <!-- Card 3: Student Attendance ML -->
+                            <div class="dataset-card" data-dataset-type="attendance_ml">
+                                <div class="dataset-card-top">
+                                    <div class="dataset-card-icon" style="background:rgba(16,185,129,0.15);color:#34d399"><i class="fa-solid fa-user-graduate"></i></div>
+                                    <input type="radio" name="aiDatasetRadio" value="attendance_ml" class="dataset-radio">
+                                </div>
+                                <h4>Attendance &amp; Engagement</h4>
+                                <p>Check-in timestamps, on-network durations, punctuality targets, and connection volume for educational retention AI models.</p>
+                                <div class="dataset-meta-chips">
+                                    <span class="meta-chip">14 Attributes</span>
+                                    <span class="meta-chip">Punctuality ML</span>
+                                    <span class="meta-chip">Engagement</span>
+                                </div>
+                            </div>
+
+                            <!-- Card 4: Full Raw Access Logs -->
+                            <div class="dataset-card" data-dataset-type="raw_logs">
+                                <div class="dataset-card-top">
+                                    <div class="dataset-card-icon" style="background:rgba(168,85,247,0.15);color:#c084fc"><i class="fa-solid fa-file-code"></i></div>
+                                    <input type="radio" name="aiDatasetRadio" value="raw_logs" class="dataset-radio">
+                                </div>
+                                <h4>Full Raw Access Logs</h4>
+                                <p>Unprocessed raw access events with normalized clean sites, user-agents, raw bytes, and gateway timestamps.</p>
+                                <div class="dataset-meta-chips">
+                                    <span class="meta-chip">Raw Stream</span>
+                                    <span class="meta-chip">Full Audit</span>
+                                    <span class="meta-chip">NLP Ready</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Export Options Toolbar -->
+                        <div class="ai-export-controls">
+                            <div class="export-options-group">
+                                <div class="export-opt-item">
+                                    <label><i class="fa-solid fa-file-export"></i> Format:</label>
+                                    <select id="exportFormatSelect" class="filter-select">
+                                        <option value="csv">CSV (Pandas / Scikit-Learn / PyTorch)</option>
+                                        <option value="json">JSON (REST APIs / Web Pipelines)</option>
+                                    </select>
+                                </div>
+
+                                <div class="export-opt-item">
+                                    <label><i class="fa-solid fa-filter"></i> Mode:</label>
+                                    <select id="exportModeSelect" class="filter-select">
+                                        <option value="clean">Clean (User Browsing Only)</option>
+                                        <option value="raw">Raw (Include OS Telemetry/Ads)</option>
+                                    </select>
+                                </div>
+
+                                <div class="export-opt-item">
+                                    <label><i class="fa-solid fa-list-ol"></i> Limit:</label>
+                                    <select id="exportLimitSelect" class="filter-select">
+                                        <option value="1000">1,000 Rows</option>
+                                        <option value="5000" selected>5,000 Rows</option>
+                                        <option value="10000">10,000 Rows</option>
+                                        <option value="0">All Historical Rows</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="export-btn-group">
+                                <button class="outline-btn" id="btnCopyDatasetAPI" title="Copy dataset API URL for curl / Python scripts">
+                                    <i class="fa-solid fa-terminal"></i> Copy API URL
+                                </button>
+                                <button class="solid-btn" id="btnDownloadAIDataset" style="background:linear-gradient(135deg,var(--indigo),var(--cyan));box-shadow:0 4px 16px rgba(99,102,241,0.4)">
+                                    <i class="fa-solid fa-cloud-arrow-down"></i> Download AI Dataset
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Attribute Dictionary Schema Preview -->
+                        <div class="schema-panel">
+                            <div class="panel-header" style="border-bottom:1px solid var(--border-dim);padding:14px 20px">
+                                <div class="panel-title-group">
+                                    <div class="panel-icon" style="background:rgba(59,130,246,0.12);color:#60a5fa"><i class="fa-solid fa-book-bookmark"></i></div>
+                                    <div>
+                                        <h4 style="font-size:14px;font-weight:700;color:var(--tx-1);margin:0">Dataset Feature Dictionary &amp; Schema</h4>
+                                        <p style="font-size:11px;color:var(--tx-3);margin:2px 0 0" id="schemaDatasetDesc">Attribute definitions, datatypes, and machine learning roles</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="schema-table-wrap">
+                                <table class="log-table mini">
+                                    <thead>
+                                        <tr>
+                                            <th>Feature Name</th>
+                                            <th>Data Type</th>
+                                            <th>ML Modeling Role</th>
+                                            <th>Description</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="schemaTableBody">
+                                        <tr><td colspan="4" class="loading-cell">Loading schema…</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <!-- Live Data Preview Table -->
+                        <div class="schema-panel">
+                            <div class="panel-header" style="border-bottom:1px solid var(--border-dim);padding:14px 20px">
+                                <div class="panel-title-group">
+                                    <div class="panel-icon" style="background:rgba(16,185,129,0.12);color:#10b981"><i class="fa-solid fa-eye"></i></div>
+                                    <div>
+                                        <h4 style="font-size:14px;font-weight:700;color:var(--tx-1);margin:0">Live Data Sample (First 5 Rows)</h4>
+                                        <p style="font-size:11px;color:var(--tx-3);margin:2px 0 0">Real-time preview of formatted features before export</p>
+                                    </div>
+                                </div>
+                                <button class="icon-btn" id="btnRefreshPreview" title="Refresh data sample"><i class="fa-solid fa-rotate"></i></button>
+                            </div>
+                            <div class="schema-table-wrap" id="previewTableContainer" style="max-height:280px">
+                                <div class="loading-cell"><i class="fa-solid fa-spinner fa-spin"></i> Generating preview sample…</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </main>
+
+    <!-- ═══════ STUDENT REGISTRATION / LINK MODAL ═══════ -->
+    <div class="modal-bg" id="studentModal">
+        <div class="modal-box">
+            <div class="modal-top">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <i class="fa-solid fa-user-plus" style="color:#10b981;font-size:18px"></i>
+                    <h3 id="studentModalTitle">Register Student &amp; Link Device</h3>
+                </div>
+                <button class="close-btn" id="btnCloseStudentModal"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-content">
+                <p class="modal-hint" id="studentModalHint">
+                    Link a student's PRN to their device MAC address. Attendance will be recorded automatically when this device connects to the Wi-Fi or hotspot.
+                </p>
+                <form id="studentRegistrationForm" style="display:flex;flex-direction:column;gap:12px;margin-top:14px">
+                    <div>
+                        <label style="display:block;font-size:11px;font-weight:700;color:var(--tx-3);margin-bottom:5px">Student PRN (Roll/ID Number)</label>
+                        <input type="text" id="regPrn" class="text-input" placeholder="e.g. 2024010501" required>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;font-weight:700;color:var(--tx-3);margin-bottom:5px">Full Name</label>
+                        <input type="text" id="regName" class="text-input" placeholder="e.g. Arjun Pawashe" required>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;font-weight:700;color:var(--tx-3);margin-bottom:5px">Department</label>
+                        <select id="regDepartment" class="filter-select" style="width:100%" required>
+                            <option value="">Select department</option>
+                        </select>
+                    </div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                        <div>
+                            <label style="display:block;font-size:11px;font-weight:700;color:var(--tx-3);margin-bottom:5px">Year</label>
+                            <select id="regYear" class="filter-select" style="width:100%" required>
+                                <option value="">Select year</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display:block;font-size:11px;font-weight:700;color:var(--tx-3);margin-bottom:5px">Division</label>
+                            <select id="regDivision" class="filter-select" style="width:100%" required>
+                                <option value="">Select div</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;font-weight:700;color:var(--tx-3);margin-bottom:5px">Batch (year-wise)</label>
+                        <div style="display:flex;gap:8px">
+                            <select id="regBatch" class="filter-select" style="flex:1" required disabled>
+                                <option value="">Select year first</option>
+                            </select>
+                            <button type="button" class="outline-btn" id="btnAddYearBatch" title="Add a batch to the selected year" style="padding:6px 12px;font-size:11px"><i class="fa-solid fa-plus"></i> Batch</button>
+                        </div>
+                    </div>
+                    <div>
+                        <label id="regMacLabel" style="display:block;font-size:11px;font-weight:700;color:var(--tx-3);margin-bottom:5px">Device MAC Address</label>
+                        <div style="display:flex;gap:8px">
+                            <input type="text" id="regMac" class="text-input" placeholder="AA:BB:CC:DD:EE:FF" maxlength="17" required style="flex:1">
+                            <select id="regDeviceSelect" class="filter-select" style="max-width:180px">
+                                <option value="">— Pick Live Device —</option>
+                            </select>
+                        </div>
+                    </div>
+                    <label id="regHistoryWrap" style="display:none;align-items:center;gap:8px;font-size:12px;color:var(--tx-2);cursor:pointer">
+                        <input type="checkbox" id="regApplyHistory" checked>
+                        Also correct this student's past attendance records
+                    </label>
+                    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:12px">
+                        <button type="button" class="outline-btn" id="btnCancelStudentModal">Cancel</button>
+                        <button type="submit" class="solid-btn" id="btnSubmitStudent" style="background:#10b981;border:none"><i class="fa-solid fa-check"></i> Save &amp; Record Attendance</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ DEVICE DRILLDOWN MODAL ═══════ -->
+    <div class="modal-bg" id="deviceModal">
+        <div class="modal-box wide-modal">
+            <div class="modal-top">
+                <div class="modal-device-header">
+                    <div class="modal-dev-avatar" id="modalDevAvatar"><i class="fa-solid fa-mobile-screen"></i></div>
+                    <div><h3 id="modalDevName">Device</h3><code id="modalDevIp">192.168.137.x</code></div>
+                </div>
+                <div class="modal-top-actions">
+                    <button class="ghost-btn" id="btnModalRename"><i class="fa-solid fa-pen"></i> Rename</button>
+                    <button class="ghost-btn" id="btnModalClearHistory" title="Delete this device's browsing history"><i class="fa-solid fa-eraser"></i> Clear history</button>
+                    <button class="ghost-btn danger-btn" id="btnModalRemoveDevice" title="Remove this device and its history"><i class="fa-solid fa-trash-can"></i> Remove</button>
+                    <button class="close-btn" id="btnCloseDeviceModal"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+            </div>
+            <div class="modal-content">
+                <!-- Tabs -->
+                <div class="modal-tabs">
+                    <button class="modal-tab active" data-tab="overview">Overview</button>
+                    <button class="modal-tab" data-tab="sessions">Sessions</button>
+                    <button class="modal-tab" data-tab="history">Full History</button>
+                </div>
+
+                <!-- Overview -->
+                <div class="modal-tab-content active" id="tab-overview">
+                    <div class="modal-stats-row">
+                        <div class="modal-stat"><span class="mstat-label">VISITS</span><strong id="modalDevRequests">0</strong></div>
+                        <div class="modal-stat"><span class="mstat-label">DATA USED</span><strong id="modalDevBandwidth">0 B</strong></div>
+                        <div class="modal-stat"><span class="mstat-label">TOP SITE</span><strong id="modalDevTopSite">—</strong></div>
+                        <div class="modal-stat"><span class="mstat-label">LAST SEEN</span><strong id="modalDevLastSeen">—</strong></div>
+                    </div>
+                    <!-- Quota bar if set -->
+                    <div id="modalQuotaBar" style="display:none" class="quota-bar-wrap">
+                        <div class="quota-bar-label">
+                            <span><i class="fa-solid fa-gauge-high"></i> Daily Quota</span>
+                            <span id="quotaBarText">0 / 0 MB</span>
+                        </div>
+                        <div class="quota-bar-track"><div class="quota-bar-fill" id="quotaBarFill"></div></div>
+                    </div>
+                    <div class="modal-section">
+                        <div class="modal-section-title"><i class="fa-solid fa-globe"></i> Most Visited Sites</div>
+                        <div class="top-chips" id="modalDevTopSitesList"></div>
+                    </div>
+                </div>
+
+                <!-- Sessions -->
+                <div class="modal-tab-content" id="tab-sessions">
+                    <div id="sessionsContainer"><div class="loading-cell">Loading sessions…</div></div>
+                </div>
+
+                <!-- History -->
+                <div class="modal-tab-content" id="tab-history">
+                    <div class="mini-table-wrap">
+                        <table class="log-table mini">
+                            <thead>
+                                <tr><th>Time</th><th>Website</th><th>Category</th><th>Size</th><th>Status</th><th></th></tr>
+                            </thead>
+                            <tbody id="modalDevLogsBody"><tr><td colspan="6" class="loading-cell">Loading…</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ RENAME MODAL ═══════ -->
+    <div class="modal-bg" id="renameModal">
+        <div class="modal-box small-modal">
+            <div class="modal-top">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <i class="fa-solid fa-pen-to-square" style="color:#6366f1;font-size:18px"></i>
+                    <h3>Set Device Nickname</h3>
+                </div>
+                <button class="close-btn" id="btnCloseRenameModal"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-content">
+                <p class="modal-hint">Give this device a recognizable name (e.g. <em>"Aman's Phone"</em>, <em>"Lab PC #4"</em>):</p>
+                <input type="text" id="renameInput" class="text-input" placeholder="Enter custom name…">
+            </div>
+            <div class="modal-bottom">
+                <button class="outline-btn" id="btnCancelRename">Cancel</button>
+                <button class="solid-btn" id="btnSaveRename">Save Name</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ SETUP GUIDE MODAL ═══════ -->
+    <div class="modal-bg" id="guideModal">
+        <div class="modal-box">
+            <div class="modal-top">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <i class="fa-solid fa-mobile-screen-button" style="color:#06b6d4;font-size:18px"></i>
+                    <h3>TL-WR740N Router Gateway Setup Guide</h3>
+                </div>
+                <button class="close-btn" id="btnCloseGuide"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-content">
+                <div class="setup-step-list">
+                    <div class="setup-step">
+                        <div class="step-num">1</div>
+                        <div class="step-body"><h4>1. Enable Windows ICS on Ethernet</h4>
+                        <p>Open <code>ncpa.cpl</code> → Wi-Fi Properties → Sharing → Share to Ethernet (<code>192.168.137.1</code>).</p></div>
+                    </div>
+                    <div class="setup-step">
+                        <div class="step-num">2</div>
+                        <div class="step-body"><h4>2. Configure TL-WR740N in AP / Bridge Mode</h4>
+                        <p>Disable DHCP on the TL-WR740N and plug the PC Ethernet cable into a <strong>LAN</strong> port.</p></div>
+                    </div>
+                    <div class="setup-step featured-step">
+                        <div class="step-num accent">3</div>
+                        <div class="step-body"><h4>3. Zero-Proxy Automatic Monitoring</h4>
+                        <p>Students just join the TL-WR740N Wi-Fi—no manual proxy needed:</p>
+                        <div class="proxy-box">
+                            <div class="proxy-row"><span>Gateway / DNS</span><code>192.168.137.1</code></div>
+                            <div class="proxy-row"><span>Captive Portal</span><code>Port 80 → 5000</code></div>
+                        </div></div>
+                    </div>
+                    <div class="setup-step">
+                        <div class="step-num">4</div>
+                        <div class="step-body"><h4>Browse — you're being monitored!</h4>
+                        <p>Unregistered devices are redirected to student check-in; registered devices are marked present automatically.</p></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-bottom">
+                <button class="solid-btn" id="btnGotIt"><i class="fa-solid fa-check"></i> Got it, I'm ready!</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ POLICY MODAL ═══════ -->
+    <div class="modal-bg" id="policyModal">
+        <div class="modal-box">
+            <div class="modal-top">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <i class="fa-solid fa-shield-halved" style="color:#f43f5e;font-size:18px"></i>
+                    <h3>Access Control &amp; Block Policy</h3>
+                </div>
+                <button class="close-btn" id="btnClosePolicy"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-content">
+                <form id="addBlockForm" class="block-form">
+                    <input type="text" id="blockDomainInput" placeholder="Domain (e.g. roblox.com)" required>
+                    <input type="text" id="blockReasonInput" placeholder="Reason (optional)">
+                    <button type="submit" class="danger-btn"><i class="fa-solid fa-ban"></i> Block</button>
+                </form>
+                <div class="rules-section">
+                    <h4 class="rules-heading">Currently Blocked Domains</h4>
+                    <ul class="rules-list" id="rulesList"><li class="empty-rules-note">No rules yet.</li></ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ QUOTA MODAL ═══════ -->
+    <div class="modal-bg" id="quotaModal">
+        <div class="modal-box">
+            <div class="modal-top">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <i class="fa-solid fa-gauge-high" style="color:#f59e0b;font-size:18px"></i>
+                    <h3>Device Daily Data Quotas</h3>
+                </div>
+                <button class="close-btn" id="btnCloseQuota"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-content">
+                <p class="modal-hint">Set a daily MB data cap per device. When exceeded, the device is blocked until midnight.</p>
+                <form id="addQuotaForm" class="block-form">
+                    <select id="quotaDeviceSelect" class="filter-select" style="flex:1">
+                        <option value="">— Select Device —</option>
+                    </select>
+                    <input type="number" id="quotaMBInput" placeholder="MB / day" min="1" style="width:110px">
+                    <button type="submit" class="solid-btn"><i class="fa-solid fa-gauge-high"></i> Set Quota</button>
+                </form>
+                <div class="rules-section" style="margin-top:16px">
+                    <h4 class="rules-heading">Active Quotas</h4>
+                    <div id="quotaList"><div class="loading-cell">Loading…</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════ LATENCY TARGETS MODAL ═══════ -->
+    <div class="modal-bg" id="latencyTargetsModal">
+        <div class="modal-box small-modal">
+            <div class="modal-top">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <i class="fa-solid fa-heartbeat" style="color:#f43f5e;font-size:18px"></i>
+                    <h3>Latency Monitor Targets</h3>
+                </div>
+                <button class="close-btn" id="btnCloseLatencyTargets"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-content">
+                <p class="modal-hint">Add hostnames to monitor network latency (measured every 30s):</p>
+                <form id="addTargetForm" class="block-form">
+                    <input type="text" id="targetLabelInput" placeholder="Label (e.g. College ERP)" required>
+                    <input type="text" id="targetHostInput" placeholder="Host (e.g. erp.college.edu)" required>
+                    <input type="number" id="targetPortInput" placeholder="Port" value="80" style="width:70px">
+                    <button type="submit" class="solid-btn"><i class="fa-solid fa-plus"></i> Add</button>
+                </form>
+                <div class="rules-section" style="margin-top:16px">
+                    <h4 class="rules-heading">Configured Targets</h4>
+                    <ul class="rules-list" id="latencyTargetsList"><li class="empty-rules-note">Loading…</li></ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toastContainer" class="toast-container"></div>
+    <script src="/static/app.js"></script>
+</body>
+</html>

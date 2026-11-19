@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Student Check-in · NetPlus</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#070c18;color:#f0f4ff;font:15px Inter,"Segoe UI",sans-serif}
+    .card{width:min(100%,460px);padding:30px;border:1px solid #26334b;border-radius:18px;background:#0c1526;box-shadow:0 24px 70px #0008}
+    h1{font-size:24px;margin:0 0 8px}.intro,.privacy{color:#94a3b8;line-height:1.55;font-size:13px}.intro{margin:0 0 22px}
+    label{display:block;margin:15px 0 6px;font-size:12px;font-weight:700;color:#cbd5e1}input,select{width:100%;padding:12px;border:1px solid #334155;border-radius:9px;background:#07101f;color:#f8fafc;font:inherit;outline:none}input:focus,select:focus{border-color:#818cf8}
+    select:disabled{opacity:.5}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}button{width:100%;margin-top:21px;padding:13px;border:0;border-radius:9px;background:#6366f1;color:white;font-weight:700;font-size:14px;cursor:pointer}button:disabled{opacity:.6;cursor:wait}
+    #message{display:none;margin-top:16px;padding:12px;border-radius:9px;background:#13243a;color:#cbd5e1;font-size:13px;line-height:1.5}.privacy{font-size:11px;margin:18px 0 0}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Student attendance check-in</h1>
+    <p class="intro">This page is shown only once per device. Register now and NetPlus will use its Wi-Fi/LAN MAC address to recognize it and record attendance when it connects.</p>
+    <form id="registrationForm">
+      <label for="prn">Student PRN</label><input id="prn" name="prn" required minlength="2" maxlength="40" autocomplete="off">
+      <label for="name">Full name</label><input id="name" name="name" required minlength="2" maxlength="100" autocomplete="name">
+      <label for="department">Department</label>
+      <select id="department" required><option value="">Select department</option></select>
+      <div class="row">
+        <div><label for="year">Year</label><select id="year" required><option value="">Select year</option></select></div>
+        <div><label for="division">Division</label><select id="division" required><option value="">Select div</option></select></div>
+      </div>
+      <label for="batch">Batch</label>
+      <select id="batch" required disabled><option value="">Select year first</option></select>
+      <button id="submitButton" type="submit">Register and mark attendance</button>
+    </form>
+    <div id="message" role="status" aria-live="polite"></div>
+    <p class="privacy">Your details are stored on the NetPlus gateway for attendance tracking. If the device uses a randomized MAC, keep that router Wi-Fi network's device address setting consistent.</p>
+  </main>
+  <script>
+    const form=document.getElementById('registrationForm');
+    const message=document.getElementById('message');
+    const button=document.getElementById('submitButton');
+    const token=new URLSearchParams(location.search).get('token');
+    if(!token){form.hidden=true;message.style.display='block';message.textContent='This check-in link is missing or expired. Please ask your lab administrator to link your device.';}
+    const departmentEl=document.getElementById('department'),yearEl=document.getElementById('year'),divisionEl=document.getElementById('division'),batchEl=document.getElementById('batch');
+    let batchesByYear={};
+    const fill=(el,items,placeholder)=>{el.innerHTML='';const o=document.createElement('option');o.value='';o.textContent=placeholder;el.appendChild(o);items.forEach(i=>{const op=document.createElement('option');op.value=i.value??i;op.textContent=i.label??i;el.appendChild(op);});};
+    fetch('/api/academic/options').then(r=>r.json()).then(o=>{
+      batchesByYear=o.batches;fill(departmentEl,o.departments,'Select department');fill(yearEl,o.years,'Select year');fill(divisionEl,o.divisions,'Select div');
+    }).catch(()=>{message.style.display='block';message.textContent='Could not load the department/year list. Refresh the page.';});
+    yearEl.addEventListener('change',()=>{const list=batchesByYear[yearEl.value]||[];fill(batchEl,list,yearEl.value?'Select batch':'Select year first');batchEl.disabled=!yearEl.value;});
+    form.addEventListener('submit',async event=>{
+      event.preventDefault();button.disabled=true;button.textContent='Registering…';message.style.display='none';
+      try{
+        const response=await fetch('/api/attendance/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,prn:document.getElementById('prn').value.trim(),name:document.getElementById('name').value.trim(),department:departmentEl.value,year:yearEl.value,division:divisionEl.value,batch:batchEl.value})});
+        const result=await response.json();if(!response.ok)throw new Error(result.detail||'Registration failed.');
+        form.hidden=true;message.style.display='block';message.textContent=`Attendance marked for ${result.name} (${result.prn}) — ${result.department}, ${result.year} Div ${result.division}, Batch ${result.batch}. You can now browse.`;
+      }catch(error){message.style.display='block';message.textContent=error.message;button.disabled=false;button.textContent='Register and mark attendance';}
+    });
+  </script>
+</body>
+</html>
